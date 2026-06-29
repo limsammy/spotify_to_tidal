@@ -250,6 +250,19 @@ async def repeat_on_request_error(function, *args, remaining=5, **kwargs):
         return await repeat_on_request_error(function, *args, remaining=remaining-1, **kwargs)
 
 
+async def _run_rate_limiter(semaphore: asyncio.Semaphore, config: dict):
+    ''' Leaky bucket algorithm for rate limiting. Periodically releases items from semaphore at rate_limit'''
+    _sleep_time = config.get('max_concurrency', 10)/config.get('rate_limit', 10)/4 # aim to sleep approx time to drain 1/4 of 'bucket'
+    t0 = datetime.datetime.now()
+    while True:
+        await asyncio.sleep(_sleep_time)
+        t = datetime.datetime.now()
+        dt = (t - t0).total_seconds()
+        new_items = round(config.get('rate_limit', 10)*dt)
+        t0 = t
+        [semaphore.release() for _ in range(new_items)] # leak new_items from the 'bucket'
+
+
 async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable) -> List[dict]:
     output = []
     results = fetch_function(0)
@@ -339,18 +352,6 @@ def get_tracks_for_new_tidal_playlist(spotify_tracks: Sequence[t_spotify.Spotify
 
 async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tracks: Sequence[t_spotify.SpotifyTrack], playlist_name: str, config: dict):
     """ Generic function for searching for each item in a list of Spotify tracks which have not already been seen and adding them to the cache """
-    async def _run_rate_limiter(semaphore):
-        ''' Leaky bucket algorithm for rate limiting. Periodically releases items from semaphore at rate_limit'''
-        _sleep_time = config.get('max_concurrency', 10)/config.get('rate_limit', 10)/4 # aim to sleep approx time to drain 1/4 of 'bucket'
-        t0 = datetime.datetime.now()
-        while True:
-            await asyncio.sleep(_sleep_time)
-            t = datetime.datetime.now()
-            dt = (t - t0).total_seconds()
-            new_items = round(config.get('rate_limit', 10)*dt)
-            t0 = t
-            [semaphore.release() for _ in range(new_items)] # leak new_items from the 'bucket'
-
     # Extract the new tracks that do not already exist in the old tidal tracklist
     tracks_to_search = get_new_spotify_tracks(spotify_tracks)
     if not tracks_to_search:
@@ -359,7 +360,7 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
     # Search for each of the tracks on Tidal concurrently
     task_description = "Searching Tidal for {}/{} tracks in Spotify playlist '{}'".format(len(tracks_to_search), len(spotify_tracks), playlist_name)
     semaphore = asyncio.Semaphore(config.get('max_concurrency', 10))
-    rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore))
+    rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore, config))
     search_results = await atqdm.gather( *[ repeat_on_request_error(tidal_search, t, semaphore, tidal_session) for t in tracks_to_search ], desc=task_description )
     rate_limiter_task.cancel()
 
@@ -492,49 +493,39 @@ async def sync_albums(spotify_session: spotipy.Spotify, tidal_session: tidalapi.
     else:
         print("No new albums to add to Tidal")
 
-def album_match(tidal_album: tidalapi.Album, spotify_album: dict, config: dict = None) -> bool:
-    """ Check if a Tidal album matches a Spotify album using progressive matching """
-    
-    # Get progressive simplifications for album names (preserve edition info)
-    spotify_variations = simple(spotify_album['name'])
-    tidal_variations = simple(tidal_album.name)
-    
-    fuzzy_threshold = config.get('fuzzy_name_threshold', 0.80) if config else 0.80
-    
-    # Try each combination of variations (strictest first)
-    album_name_matches = False
-    for spotify_name in spotify_variations:
-        for tidal_name in tidal_variations:
-            spotify_lower = spotify_name.lower()
-            tidal_lower = tidal_name.lower()
-            
-            # Exact substring match
-            if spotify_lower in tidal_lower or tidal_lower in spotify_lower:
-                album_name_matches = True
-                break
-                
+def _names_match(spotify_name: str, tidal_name: str, config: dict = None,
+                 threshold_key: str = 'fuzzy_name_threshold', default_threshold: float = 0.85) -> bool:
+    """ Compare two names using progressive simplification, unicode normalization and
+        optional fuzzy matching. Shared by artist matching and album name/artist matching. """
+    fuzzy_threshold = config.get(threshold_key, default_threshold) if config else default_threshold
+    for spotify_var in simple(spotify_name):
+        for tidal_var in simple(tidal_name):
+            spotify_lower = spotify_var.lower()
+            tidal_lower = tidal_var.lower()
+
+            # Exact / substring match
+            if spotify_lower == tidal_lower or spotify_lower in tidal_lower or tidal_lower in spotify_lower:
+                return True
+
             # Unicode normalized match
             norm_spotify = normalize(spotify_lower)
             norm_tidal = normalize(tidal_lower)
-            if norm_spotify in norm_tidal or norm_tidal in norm_spotify:
-                album_name_matches = True
-                break
-                
+            if norm_spotify == norm_tidal or norm_spotify in norm_tidal or norm_tidal in norm_spotify:
+                return True
+
             # Fuzzy matching (if enabled)
             if config and config.get('enable_fuzzy_matching', False):
-                similarity = SequenceMatcher(None, spotify_lower, tidal_lower).ratio()
-                norm_similarity = SequenceMatcher(None, norm_spotify, norm_tidal).ratio()
-                
-                if similarity >= fuzzy_threshold or norm_similarity >= fuzzy_threshold:
-                    album_name_matches = True
-                    break
-        
-        if album_name_matches:
-            break
-    
-    if not album_name_matches:
+                if (SequenceMatcher(None, spotify_lower, tidal_lower).ratio() >= fuzzy_threshold
+                        or SequenceMatcher(None, norm_spotify, norm_tidal).ratio() >= fuzzy_threshold):
+                    return True
+    return False
+
+def album_match(tidal_album: tidalapi.Album, spotify_album: dict, config: dict = None) -> bool:
+    """ Check if a Tidal album matches a Spotify album using progressive matching """
+    # Album name must match (progressive simplification preserves edition info)
+    if not _names_match(spotify_album['name'], tidal_album.name, config, default_threshold=0.80):
         return False
-    
+
     # Artist matching using progressive simplification
     def get_artists(album):
         """Extract artist names from an album"""
@@ -542,7 +533,7 @@ def album_match(tidal_album: tidalapi.Album, spotify_album: dict, config: dict =
             return [artist.name for artist in album.artists]
         else:  # Spotify album
             return [artist['name'] for artist in album['artists']]
-    
+
     def split_artists(artist_names):
         """Split artist names on common separators"""
         result = []
@@ -556,166 +547,62 @@ def album_match(tidal_album: tidalapi.Album, spotify_album: dict, config: dict =
             else:
                 result.append(artist_name)
         return [name.strip() for name in result]
-    
-    # Get all artist variations for both albums
+
     tidal_artists = split_artists(get_artists(tidal_album))
     spotify_artists = split_artists(get_artists(spotify_album))
-    
-    fuzzy_artist_threshold = config.get('fuzzy_artist_threshold', 0.75) if config else 0.75
-    
-    # Try progressive matching for artists
+
+    # There must be at least one overlapping artist between the two albums
     for tidal_artist in tidal_artists:
-        tidal_variations = simple(tidal_artist)
-        
         for spotify_artist in spotify_artists:
-            spotify_variations = simple(spotify_artist)
-            
-            # Try each combination of variations
-            for tidal_var in tidal_variations:
-                for spotify_var in spotify_variations:
-                    tidal_lower = tidal_var.lower()
-                    spotify_lower = spotify_var.lower()
-                    
-                    # Exact match
-                    if tidal_lower == spotify_lower:
-                        return True
-                    
-                    # Substring match
-                    if tidal_lower in spotify_lower or spotify_lower in tidal_lower:
-                        return True
-                    
-                    # Unicode normalized match
-                    norm_tidal = normalize(tidal_lower)
-                    norm_spotify = normalize(spotify_lower)
-                    if norm_tidal == norm_spotify:
-                        return True
-                    
-                    # Fuzzy matching
-                    if config and config.get('enable_fuzzy_matching', False):
-                        similarity = SequenceMatcher(None, tidal_lower, spotify_lower).ratio()
-                        norm_similarity = SequenceMatcher(None, norm_tidal, norm_spotify).ratio()
-                        
-                        if similarity >= fuzzy_artist_threshold or norm_similarity >= fuzzy_artist_threshold:
-                            return True
-    
+            if _names_match(spotify_artist, tidal_artist, config,
+                            threshold_key='fuzzy_artist_threshold', default_threshold=0.75):
+                return True
     return False
 
 def artist_match(tidal_artist: tidalapi.Artist, spotify_artist: dict, config: dict = None) -> bool:
     """ Check if a Tidal artist matches a Spotify artist using progressive matching """
-    
-    # Get progressive simplifications for artist names
-    spotify_variations = simple(spotify_artist['name'])
-    tidal_variations = simple(tidal_artist.name)
-    
-    fuzzy_threshold = config.get('fuzzy_name_threshold', 0.85) if config else 0.85
-    
-    # Try each combination of variations (strictest first)
-    for spotify_name in spotify_variations:
-        for tidal_name in tidal_variations:
-            spotify_lower = spotify_name.lower()
-            tidal_lower = tidal_name.lower()
-            
-            # Exact match
-            if spotify_lower == tidal_lower:
-                return True
-                
-            # Exact substring match
-            if spotify_lower in tidal_lower or tidal_lower in spotify_lower:
-                return True
-                
-            # Unicode normalized match
-            norm_spotify = normalize(spotify_lower)
-            norm_tidal = normalize(tidal_lower)
-            if norm_spotify == norm_tidal:
-                return True
-                
-            if norm_spotify in norm_tidal or norm_tidal in norm_spotify:
-                return True
-                
-            # Fuzzy matching (if enabled)
-            if config and config.get('enable_fuzzy_matching', False):
-                similarity = SequenceMatcher(None, spotify_lower, tidal_lower).ratio()
-                norm_similarity = SequenceMatcher(None, norm_spotify, norm_tidal).ratio()
-                
-                if similarity >= fuzzy_threshold or norm_similarity >= fuzzy_threshold:
-                    return True
-    
-    return False
+    return _names_match(spotify_artist['name'], tidal_artist.name, config, default_threshold=0.85)
+
+def _populate_match_cache(spotify_items: Sequence[dict], tidal_items: Sequence, cache, match_fn: Callable, config: dict = None):
+    """ Two-pass match of Spotify items against Tidal items, inserting matches into the given cache.
+        First pass iterates Tidal items; second pass retries any unmatched Spotify items.
+        Each side is matched at most once to avoid duplicate mappings. """
+    matched_spotify_ids = set()
+    matched_tidal_ids = set()
+
+    def _try_match(spotify_item, tidal_item) -> bool:
+        if spotify_item['id'] in matched_spotify_ids or tidal_item.id in matched_tidal_ids:
+            return False
+        if match_fn(tidal_item, spotify_item, config):
+            cache.insert((spotify_item['id'], tidal_item.id))
+            matched_spotify_ids.add(spotify_item['id'])
+            matched_tidal_ids.add(tidal_item.id)
+            return True
+        return False
+
+    # First pass: match each Tidal item to a Spotify item
+    for tidal_item in tidal_items:
+        if tidal_item.id in matched_tidal_ids:
+            continue
+        for spotify_item in spotify_items:
+            if _try_match(spotify_item, tidal_item):
+                break
+
+    # Second pass: retry remaining Spotify items against remaining Tidal items
+    for spotify_item in spotify_items:
+        if spotify_item['id'] in matched_spotify_ids:
+            continue
+        for tidal_item in tidal_items:
+            if _try_match(spotify_item, tidal_item):
+                break
 
 def populate_album_match_cache(spotify_albums: Sequence[dict], tidal_albums: Sequence[tidalapi.Album], config: dict = None):
-    """ 
-    Populate the album match cache with existing albums.
-    """
-    # Track which albums have already been matched to avoid duplicates
-    matched_spotify_ids = set()
-    matched_tidal_ids = set()
-    
-    # First pass: match tidal albums to spotify albums
-    for tidal_album in tidal_albums:
-        if tidal_album.id in matched_tidal_ids:
-            continue
-        
-        for spotify_album in spotify_albums:
-            if spotify_album['id'] in matched_spotify_ids:
-                continue
-                
-            if album_match(tidal_album, spotify_album, config):
-                album_match_cache.insert((spotify_album['id'], tidal_album.id))
-                matched_spotify_ids.add(spotify_album['id'])
-                matched_tidal_ids.add(tidal_album.id)
-                break
-    
-    # Second pass: match remaining spotify albums to remaining tidal albums
-    for spotify_album in spotify_albums:
-        if spotify_album['id'] in matched_spotify_ids:
-            continue
-            
-        for tidal_album in tidal_albums:
-            if tidal_album.id in matched_tidal_ids:
-                continue
-                
-            if album_match(tidal_album, spotify_album, config):
-                album_match_cache.insert((spotify_album['id'], tidal_album.id))
-                matched_spotify_ids.add(spotify_album['id'])
-                matched_tidal_ids.add(tidal_album.id)
-                break
+    """ Populate the album match cache with existing albums. """
+    _populate_match_cache(spotify_albums, tidal_albums, album_match_cache, album_match, config)
 
 def populate_artist_match_cache(spotify_artists: Sequence[dict], tidal_artists: Sequence[tidalapi.Artist], config: dict = None):
-    """ 
-    Populate the artist match cache with existing artists.
-    """
-    # Track which artists have already been matched to avoid duplicates
-    matched_spotify_ids = set()
-    matched_tidal_ids = set()
-    
-    for tidal_artist in tidal_artists:
-        if tidal_artist.id in matched_tidal_ids:
-            continue
-        
-        for spotify_artist in spotify_artists:
-            if spotify_artist['id'] in matched_spotify_ids:
-                continue
-                
-            if artist_match(tidal_artist, spotify_artist, config):
-                artist_match_cache.insert((spotify_artist['id'], tidal_artist.id))
-                matched_spotify_ids.add(spotify_artist['id'])
-                matched_tidal_ids.add(tidal_artist.id)
-                break
-    
-    # Second pass: try remaining unmatched Spotify artists against unmatched Tidal artists
-    for spotify_artist in spotify_artists:
-        if spotify_artist['id'] in matched_spotify_ids:
-            continue
-            
-        for tidal_artist in tidal_artists:
-            if tidal_artist.id in matched_tidal_ids:
-                continue
-                
-            if artist_match(tidal_artist, spotify_artist, config):
-                artist_match_cache.insert((spotify_artist['id'], tidal_artist.id))
-                matched_spotify_ids.add(spotify_artist['id'])
-                matched_tidal_ids.add(tidal_artist.id)
-                break
+    """ Populate the artist match cache with existing artists. """
+    _populate_match_cache(spotify_artists, tidal_artists, artist_match_cache, artist_match, config)
 
 async def search_new_albums_on_tidal(tidal_session: tidalapi.Session, spotify_albums: Sequence[dict], config: dict):
     """ Search for Spotify albums on Tidal and cache the results """
@@ -807,18 +694,6 @@ async def search_new_albums_on_tidal(tidal_session: tidalapi.Session, spotify_al
             print(f"  Artist-only search for '{artist_simple}' failed: {e}")
                 
         return None
-    
-    # Rate limiter setup similar to track search
-    async def _run_rate_limiter(semaphore):
-        _sleep_time = config.get('max_concurrency', 10)/config.get('rate_limit', 10)/4
-        t0 = datetime.datetime.now()
-        while True:
-            await asyncio.sleep(_sleep_time)
-            t = datetime.datetime.now()
-            dt = (t - t0).total_seconds()
-            new_items = round(config.get('rate_limit', 10)*dt)
-            t0 = t
-            [semaphore.release() for _ in range(new_items)]
 
     albums_to_search = get_new_spotify_albums(spotify_albums)
     if not albums_to_search:
@@ -827,7 +702,7 @@ async def search_new_albums_on_tidal(tidal_session: tidalapi.Session, spotify_al
     # Search for each album on Tidal concurrently
     task_description = f"Searching Tidal for {len(albums_to_search)}/{len(spotify_albums)} albums"
     semaphore = asyncio.Semaphore(config.get('max_concurrency', 10))
-    rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore))
+    rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore, config))
     search_results = await atqdm.gather(*[repeat_on_request_error(tidal_album_search, a, semaphore, tidal_session) for a in albums_to_search], desc=task_description)
     rate_limiter_task.cancel()
 
@@ -917,22 +792,11 @@ async def search_new_artists_on_tidal(tidal_session: tidalapi.Session, spotify_a
         except Exception as e:
             print(f"  Search error for '{query}': {e}")
             return None
-    
-    async def _run_rate_limiter(semaphore):
-        _sleep_time = config.get('max_concurrency', 10)/config.get('rate_limit', 10)/4
-        t0 = datetime.datetime.now()
-        while True:
-            await asyncio.sleep(_sleep_time)
-            t = datetime.datetime.now()
-            dt = (t - t0).total_seconds()
-            new_items = round(config.get('rate_limit', 10)*dt)
-            t0 = t
-            [semaphore.release() for _ in range(new_items)]
 
     # Search for each artist on Tidal concurrently
     task_description = f"Searching Tidal for {len(new_spotify_artists)}/{len(spotify_artists)} artists"
     semaphore = asyncio.Semaphore(config.get('max_concurrency', 10))
-    rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore))
+    rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore, config))
     search_results = await atqdm.gather(*[repeat_on_request_error(tidal_artist_search, a, semaphore, tidal_session) for a in new_spotify_artists], desc=task_description)
     rate_limiter_task.cancel()
 
