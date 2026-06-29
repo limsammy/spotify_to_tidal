@@ -137,7 +137,7 @@ def name_match(tidal_track, spotify_track) -> bool:
     simple_spotify_track = simple(spotify_track['name'])[0].lower().split('feat.')[0].strip()
     return simple_spotify_track in tidal_track.name.lower() or normalize(simple_spotify_track) in normalize(tidal_track.name.lower())
 
-def artist_match(tidal: tidalapi.Track | tidalapi.Album, spotify) -> bool:
+def artists_overlap(tidal: tidalapi.Track | tidalapi.Album, spotify) -> bool:
     def split_artist_name(artist: str) -> Sequence[str]:
        if '&' in artist:
            return artist.split('&')
@@ -178,13 +178,13 @@ def match(tidal_track, spotify_track) -> bool:
     return isrc_match(tidal_track, spotify_track) or (
         duration_match(tidal_track, spotify_track)
         and name_match(tidal_track, spotify_track)
-        and artist_match(tidal_track, spotify_track)
+        and artists_overlap(tidal_track, spotify_track)
     )
 
 def test_album_similarity(spotify_album, tidal_album, threshold=0.6):
     spotify_simple = simple(spotify_album['name'])[0]
     tidal_simple = simple(tidal_album.name)[0]
-    return SequenceMatcher(None, spotify_simple, tidal_simple).ratio() >= threshold and artist_match(tidal_album, spotify_album)
+    return SequenceMatcher(None, spotify_simple, tidal_simple).ratio() >= threshold and artists_overlap(tidal_album, spotify_album)
 
 async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Session) -> tidalapi.Track | None:
     def _search_for_track_in_album():
