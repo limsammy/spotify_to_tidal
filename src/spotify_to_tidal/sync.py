@@ -365,13 +365,11 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
     rate_limiter_task.cancel()
 
     # Add the search results to the cache
-    song404 = []
     for idx, spotify_track in enumerate(tracks_to_search):
         if search_results[idx]:
             track_match_cache.insert( (spotify_track['id'], search_results[idx].id) )
         else:
             song_info = f"{spotify_track['id']}: {','.join([a['name'] for a in spotify_track['artists']])} - {spotify_track['name']}"
-            song404.append(song_info)
             add_not_found_item('track', song_info, playlist_name)
             color = ('\033[91m', '\033[0m')
             print(color[0] + "Could not find the track " + song_info + color[1])
@@ -707,13 +705,11 @@ async def search_new_albums_on_tidal(tidal_session: tidalapi.Session, spotify_al
     rate_limiter_task.cancel()
 
     # Add search results to cache
-    albums_not_found = []
     for idx, spotify_album in enumerate(albums_to_search):
         if search_results[idx]:
             album_match_cache.insert((spotify_album['id'], search_results[idx].id))
         else:
             album_info = f"{spotify_album['id']}: {','.join([a['name'] for a in spotify_album['artists']])} - {spotify_album['name']}"
-            albums_not_found.append(album_info)
             add_not_found_item('album', album_info)
             color = ('\033[91m', '\033[0m')
             print(color[0] + "Could not find album " + album_info + color[1])
@@ -801,13 +797,11 @@ async def search_new_artists_on_tidal(tidal_session: tidalapi.Session, spotify_a
     rate_limiter_task.cancel()
 
     # Cache the results
-    artists_not_found = []
     for idx, spotify_artist in enumerate(new_spotify_artists):
         if search_results[idx]:
             artist_match_cache.insert((spotify_artist['id'], search_results[idx].id))
         else:
             artist_info = f"{spotify_artist['name']}"
-            artists_not_found.append(artist_info)
             add_not_found_item('artist', artist_info)
 
 def sync_albums_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
