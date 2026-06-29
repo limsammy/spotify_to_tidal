@@ -5,7 +5,7 @@ from .cache import failure_cache, track_match_cache, album_match_cache, artist_m
 import datetime
 from difflib import SequenceMatcher
 from functools import partial
-from typing import Callable, List, Sequence, Set, Mapping
+from typing import Callable, List, Optional, Sequence, Set, Mapping
 import math
 import requests
 import sys
@@ -491,7 +491,7 @@ async def sync_albums(spotify_session: spotipy.Spotify, tidal_session: tidalapi.
     else:
         print("No new albums to add to Tidal")
 
-def _names_match(spotify_name: str, tidal_name: str, config: dict = None,
+def _names_match(spotify_name: str, tidal_name: str, config: Optional[dict] = None,
                  threshold_key: str = 'fuzzy_name_threshold', default_threshold: float = 0.85) -> bool:
     """ Compare two names using progressive simplification, unicode normalization and
         optional fuzzy matching. Shared by artist matching and album name/artist matching. """
@@ -518,7 +518,7 @@ def _names_match(spotify_name: str, tidal_name: str, config: dict = None,
                     return True
     return False
 
-def album_match(tidal_album: tidalapi.Album, spotify_album: dict, config: dict = None) -> bool:
+def album_match(tidal_album: tidalapi.Album, spotify_album: dict, config: Optional[dict] = None) -> bool:
     """ Check if a Tidal album matches a Spotify album using progressive matching """
     # Album name must match (progressive simplification preserves edition info)
     if not _names_match(spotify_album['name'], tidal_album.name, config, default_threshold=0.80):
@@ -557,11 +557,11 @@ def album_match(tidal_album: tidalapi.Album, spotify_album: dict, config: dict =
                 return True
     return False
 
-def artist_match(tidal_artist: tidalapi.Artist, spotify_artist: dict, config: dict = None) -> bool:
+def artist_match(tidal_artist: tidalapi.Artist, spotify_artist: dict, config: Optional[dict] = None) -> bool:
     """ Check if a Tidal artist matches a Spotify artist using progressive matching """
     return _names_match(spotify_artist['name'], tidal_artist.name, config, default_threshold=0.85)
 
-def _populate_match_cache(spotify_items: Sequence[dict], tidal_items: Sequence, cache, match_fn: Callable, config: dict = None):
+def _populate_match_cache(spotify_items: Sequence[dict], tidal_items: Sequence, cache, match_fn: Callable, config: Optional[dict] = None):
     """ Two-pass match of Spotify items against Tidal items, inserting matches into the given cache.
         First pass iterates Tidal items; second pass retries any unmatched Spotify items.
         Each side is matched at most once to avoid duplicate mappings. """
@@ -594,11 +594,11 @@ def _populate_match_cache(spotify_items: Sequence[dict], tidal_items: Sequence, 
             if _try_match(spotify_item, tidal_item):
                 break
 
-def populate_album_match_cache(spotify_albums: Sequence[dict], tidal_albums: Sequence[tidalapi.Album], config: dict = None):
+def populate_album_match_cache(spotify_albums: Sequence[dict], tidal_albums: Sequence[tidalapi.Album], config: Optional[dict] = None):
     """ Populate the album match cache with existing albums. """
     _populate_match_cache(spotify_albums, tidal_albums, album_match_cache, album_match, config)
 
-def populate_artist_match_cache(spotify_artists: Sequence[dict], tidal_artists: Sequence[tidalapi.Artist], config: dict = None):
+def populate_artist_match_cache(spotify_artists: Sequence[dict], tidal_artists: Sequence[tidalapi.Artist], config: Optional[dict] = None):
     """ Populate the artist match cache with existing artists. """
     _populate_match_cache(spotify_artists, tidal_artists, artist_match_cache, artist_match, config)
 

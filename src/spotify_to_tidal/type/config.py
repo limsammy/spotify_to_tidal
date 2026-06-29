@@ -24,8 +24,10 @@ class SyncConfig(TypedDict):
     spotify: SpotifyConfig
     sync_playlists: Optional[List[PlaylistConfig]]
     excluded_playlists: Optional[List[str]]
+    sync_playlists_default: Optional[bool]
     sync_favorites_default: Optional[bool]
     sync_albums_default: Optional[bool]
+    sync_artists_default: Optional[bool]
     max_concurrency: Optional[int]
     rate_limit: Optional[int]
     enable_fuzzy_matching: Optional[bool]
