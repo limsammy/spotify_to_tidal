@@ -785,6 +785,9 @@ async def search_new_artists_on_tidal(tidal_session: tidalapi.Session, spotify_a
                     if artist_match(tidal_artist, spotify_artist, config):
                         return tidal_artist
             return None
+        except (tidalapi.exceptions.TooManyRequests, requests.exceptions.RequestException, spotipy.exceptions.SpotifyException):
+            # let repeat_on_request_error handle rate limiting / transient request errors with backoff
+            raise
         except Exception as e:
             print(f"  Search error for '{query}': {e}")
             return None
