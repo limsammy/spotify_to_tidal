@@ -231,16 +231,31 @@ async def repeat_on_request_error(function, *args, remaining=5, **kwargs):
     try:
         return await function(*args, **kwargs)
     except (tidalapi.exceptions.TooManyRequests, requests.exceptions.RequestException, spotipy.exceptions.SpotifyException) as e:
-        if remaining:
-            print(f"{str(e)} occurred, retrying {remaining} times")
-        else:
-            print(f"{str(e)} could not be recovered")
-
         # Locate the underlying HTTP response, which may be on the exception directly
         # (requests) or on the wrapped cause (tidalapi TooManyRequests)
         response = getattr(e, 'response', None)
         if response is None and getattr(e, '__cause__', None) is not None:
             response = getattr(e.__cause__, 'response', None)
+
+        # Only retry transient failures: rate limits (429), server errors (5xx), and
+        # connection/timeout errors (no HTTP status). Other 4xx (e.g. 412 precondition,
+        # 400/403/404) won't recover by retrying, so fail fast instead of burning the backoff.
+        status = getattr(response, 'status_code', None)
+        if status is None:
+            status = getattr(e, 'http_status', None)  # spotipy.SpotifyException
+        is_rate_limit = isinstance(e, tidalapi.exceptions.TooManyRequests) or status == 429
+        retryable = is_rate_limit or status is None or status >= 500
+        if not retryable:
+            print(f"{str(e)} is not retryable (HTTP {status}); aborting without retry")
+            if response is not None:
+                print(f"Response message: {response.text}")
+            raise
+
+        if remaining:
+            print(f"{str(e)} occurred, retrying {remaining} times")
+        else:
+            print(f"{str(e)} could not be recovered")
+
         if response is not None:
             print(f"Response message: {response.text}")
             print(f"Response headers: {response.headers}")
