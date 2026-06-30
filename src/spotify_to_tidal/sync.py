@@ -449,8 +449,10 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
     await search_new_tracks_on_tidal(tidal_session, spotify_tracks, "Favorites", config)
     new_tidal_favorite_ids = get_new_tidal_favorites()
     if new_tidal_favorite_ids:
+        async def _add_favorite(tidal_id):
+            return await asyncio.to_thread(tidal_session.user.favorites.add_track, tidal_id)
         for tidal_id in tqdm(new_tidal_favorite_ids, desc="Adding new tracks to Tidal favorites"):
-            tidal_session.user.favorites.add_track(tidal_id)
+            await repeat_on_request_error(_add_favorite, tidal_id)
     else:
         print("No new tracks to add to Tidal favorites")
 
@@ -488,8 +490,10 @@ async def sync_albums(spotify_session: spotipy.Spotify, tidal_session: tidalapi.
     new_tidal_album_ids = get_new_tidal_albums()
     
     if new_tidal_album_ids:
+        async def _add_album(tidal_id):
+            return await asyncio.to_thread(add_album_to_tidal_collection, tidal_session, tidal_id)
         for tidal_id in tqdm(new_tidal_album_ids, desc="Adding new albums to Tidal"):
-            add_album_to_tidal_collection(tidal_session, tidal_id)
+            await repeat_on_request_error(_add_album, tidal_id)
     else:
         print("No new albums to add to Tidal")
 
@@ -755,8 +759,10 @@ async def sync_artists(spotify_session: spotipy.Spotify, tidal_session: tidalapi
     await search_new_artists_on_tidal(tidal_session, spotify_artists, config)
     new_tidal_artist_ids = get_new_tidal_artists()
     if new_tidal_artist_ids:
+        async def _add_artist(tidal_id):
+            return await asyncio.to_thread(add_artist_to_tidal_collection, tidal_session, tidal_id)
         for tidal_id in tqdm(new_tidal_artist_ids, desc="Following new artists on Tidal"):
-            add_artist_to_tidal_collection(tidal_session, tidal_id)
+            await repeat_on_request_error(_add_artist, tidal_id)
     else:
         print("No new artists to follow on Tidal")
 

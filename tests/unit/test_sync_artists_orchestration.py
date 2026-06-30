@@ -11,6 +11,7 @@ import asyncio
 from unittest import mock
 
 import pytest
+import tidalapi
 
 from spotify_to_tidal import sync as sync_mod
 from spotify_to_tidal.cache import artist_match_cache
@@ -211,10 +212,10 @@ def test_sync_artists_skips_already_followed(mocker):
     tidal_session.user.favorites.add_artist.assert_not_called()
 
 
-def test_sync_artists_add_failure_propagates(mocker):
-    # NOTE: documents current behaviour — sync_artists does NOT wrap
-    # add_artist_to_tidal_collection in repeat_on_request_error, so an error
-    # while following an artist aborts the run rather than being retried/logged.
+def test_sync_artists_add_retries_on_rate_limit(mocker):
+    # Follow calls go through repeat_on_request_error: a transient rate-limit
+    # error is retried with backoff rather than aborting the run.
+    mocker.patch.object(sync_mod.time, "sleep")  # don't actually sleep between retries
     spotify_session = mock.MagicMock()
     spotify_session.current_user_followed_artists.return_value = _followed_page(
         [{"id": "sp1", "name": "Artist One"}]
@@ -222,9 +223,30 @@ def test_sync_artists_add_failure_propagates(mocker):
     _patch_sync_artists(mocker, found_map={"sp1": 101})
 
     tidal_session = mock.MagicMock()
-    tidal_session.user.favorites.add_artist.side_effect = Exception("API Error")
+    tidal_session.user.favorites.add_artist.side_effect = [
+        tidalapi.exceptions.TooManyRequests("rate limited"),  # first attempt fails
+        None,  # retry succeeds
+    ]
 
-    with pytest.raises(Exception, match="API Error"):
+    asyncio.run(sync_mod.sync_artists(spotify_session, tidal_session, _config()))
+
+    assert tidal_session.user.favorites.add_artist.call_count == 2
+    assert all(c.args[0] == 101 for c in tidal_session.user.favorites.add_artist.call_args_list)
+
+
+def test_sync_artists_add_non_retryable_error_propagates(mocker):
+    # Non request/rate-limit errors are not caught by repeat_on_request_error,
+    # so a genuine bug while following an artist still surfaces.
+    spotify_session = mock.MagicMock()
+    spotify_session.current_user_followed_artists.return_value = _followed_page(
+        [{"id": "sp1", "name": "Artist One"}]
+    )
+    _patch_sync_artists(mocker, found_map={"sp1": 101})
+
+    tidal_session = mock.MagicMock()
+    tidal_session.user.favorites.add_artist.side_effect = ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
         asyncio.run(sync_mod.sync_artists(spotify_session, tidal_session, _config()))
     tidal_session.user.favorites.add_artist.assert_called_once_with(101)
 
