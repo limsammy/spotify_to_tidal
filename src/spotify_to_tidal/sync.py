@@ -282,12 +282,12 @@ async def _run_rate_limiter(semaphore: asyncio.Semaphore, config: dict):
         [semaphore.release() for _ in range(new_items)] # leak new_items from the 'bucket'
 
 
-async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable) -> List[dict]:
+async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable, item_key: str = "track") -> List[dict]:
     output = []
     results = fetch_function(0)
-    output.extend([item['track'] for item in results['items'] if item['track'] is not None])
+    output.extend([item[item_key] for item in results['items'] if item.get(item_key) is not None])
 
-    # Get all the remaining tracks in parallel
+    # Get all the remaining items in parallel
     if results['next']:
         offsets = [results['limit'] * n for n in range(1, math.ceil(results['total'] / results['limit']))]
         extra_results = await atqdm.gather(
@@ -295,7 +295,7 @@ async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable) -> List[di
             desc="Fetching additional data chunks"
         )
         for extra_result in extra_results:
-            output.extend([item['track'] for item in extra_result['items'] if item['track'] is not None])
+            output.extend([item[item_key] for item in extra_result['items'] if item.get(item_key) is not None])
 
     return output
 
@@ -465,26 +465,9 @@ def sync_favorites_wrapper(spotify_session: spotipy.Spotify, tidal_session: tida
 async def sync_albums(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
     """ sync saved albums from Spotify to Tidal """
     async def get_albums_from_spotify_saved() -> List[dict]:
-        async def _fetch_all_albums_from_spotify_in_chunks(fetch_function: Callable) -> List[dict]:
-            output = []
-            results = fetch_function(0)
-            output.extend([item['album'] for item in results['items'] if item['album'] is not None])
-
-            # Get all the remaining albums in parallel
-            if results['next']:
-                offsets = [results['limit'] * n for n in range(1, math.ceil(results['total'] / results['limit']))]
-                extra_results = await atqdm.gather(
-                    *[asyncio.to_thread(fetch_function, offset) for offset in offsets],
-                    desc="Fetching additional data chunks"
-                )
-                for extra_result in extra_results:
-                    output.extend([item['album'] for item in extra_result['items'] if item['album'] is not None])
-
-            return output
-
         _get_saved_albums = lambda offset: spotify_session.current_user_saved_albums(offset=offset)
-        albums = await repeat_on_request_error(_fetch_all_albums_from_spotify_in_chunks, _get_saved_albums)
-        albums.reverse() 
+        albums = await repeat_on_request_error(_fetch_all_from_spotify_in_chunks, _get_saved_albums, item_key="album")
+        albums.reverse()
         return albums
 
     def get_new_tidal_albums() -> List[str]:
