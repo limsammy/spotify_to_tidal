@@ -52,8 +52,9 @@ def main():
     # Clear any previous not found logs
     _logfile.clear_not_found_log()
 
-    # Resolve followed artists FIRST (when enabled) so the track/album syncs below can harvest their
-    # Tidal ids for free from matched releases; the follow step itself happens after, in finish.
+    # Prepare the followed-artist sync FIRST (when enabled): this builds the set of artists that still
+    # need following on Tidal. We run it before the track/album syncs as an optimisation - since most
+    # followed artists also have a track or album somewhere in the collection, matching those releases
     artist_ctx = None
     if sync_artists:
         artist_ctx = _sync.prepare_artist_sync_wrapper(spotify_session, tidal_session, config)
