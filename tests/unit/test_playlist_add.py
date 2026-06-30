@@ -5,9 +5,7 @@ import asyncio
 import requests
 import tidalapi
 
-from spotify_to_tidal import sync as sync_mod
 from spotify_to_tidal import tidalapi_patch as patch_mod
-from spotify_to_tidal.tidalapi_patch import clear_tidal_playlist
 
 
 class _Resp412:
@@ -16,20 +14,23 @@ class _Resp412:
     headers = {}
 
 
-def test_add_tracks_retries_per_chunk_without_duplicates(monkeypatch):
-    """A rate-limit error on one chunk retries only that chunk — earlier chunks
-    are not re-added (which a whole-operation retry would have duplicated)."""
-    monkeypatch.setattr(sync_mod.time, "sleep", lambda s: None)  # no real backoff
+def _no_backoff(monkeypatch):
+    """Skip the real asyncio.sleep backoff between 412 retries."""
+    async def _sleep(_):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
 
+
+def test_add_tracks_retries_chunk_on_rate_limit_without_duplicates(monkeypatch):
+    """A rate-limit error on one chunk retries only that chunk (via repeat_on_request_error) —
+    earlier chunks are not re-added, which a whole-operation retry would have duplicated."""
+    _no_backoff(monkeypatch)
     added = []
     calls = {"n": 0}
 
     class FakePlaylist:
-        def __init__(self):
-            self.reparsed_before_first_add = None
         def _reparse(self):
-            # records whether the ETag was refreshed before any add happened
-            self.reparsed_before_first_add = (len(added) == 0)
+            pass
         def add(self, chunk):
             calls["n"] += 1
             # fail the first attempt at the second chunk, succeed on retry
@@ -37,54 +38,15 @@ def test_add_tracks_retries_per_chunk_without_duplicates(monkeypatch):
                 raise tidalapi.exceptions.TooManyRequests("rate limited")
             added.append(list(chunk))
 
-    pl = FakePlaylist()
-    asyncio.run(sync_mod._add_tracks_to_tidal_playlist(pl, [1, 2, 3, 4, 5], chunk_size=2))
+    asyncio.run(patch_mod.add_tracks_to_tidal_playlist(FakePlaylist(), [1, 2, 3, 4, 5], chunk_size=2))
 
-    # ETag refreshed before the first add (avoids the 412 on the add path)
-    assert pl.reparsed_before_first_add is True
     # every track added exactly once, in order — no duplicate of the [1, 2] chunk
     assert added == [[1, 2], [3, 4], [5]]
 
 
-def test_clear_tidal_playlist_refreshes_etag_before_first_delete():
-    """The custom chunk fetcher doesn't set _etag, so clear must _reparse() to get a fresh ETag
-    before the first DELETE — otherwise Tidal returns 412 Precondition Failed."""
-    events = []
-
-    class FakeRequest:
-        def __init__(self, pl):
-            self.pl = pl
-
-        def request(self, method, url, headers=None):
-            events.append((method, dict(headers) if headers else None))
-            self.pl._pending = 0  # the DELETE cleared the chunk
-
-    class FakePlaylist:
-        _base_url = "playlists/%s"
-
-        def __init__(self):
-            self.id = "p1"
-            self._etag = None      # bug condition: chunk fetcher never populated the ETag
-            self.num_tracks = 13
-            self._pending = 13
-            self.request = FakeRequest(self)
-
-        def _reparse(self):
-            events.append(("reparse", self._etag))
-            self._etag = "fresh-etag"
-            self.num_tracks = self._pending
-
-    clear_tidal_playlist(FakePlaylist(), chunk_size=20)
-
-    assert events[0] == ("reparse", None)  # refreshed the ETag before anything else
-    deletes = [e for e in events if e[0] == "DELETE"]
-    assert deletes and deletes[0][1] == {"If-None-Match": "fresh-etag"}  # delete used the fresh ETag
-
-
 def test_add_tracks_retries_chunk_on_412_after_refreshing_etag(monkeypatch):
-    """A 412 on a chunk add refreshes the ETag and retries just that chunk (no duplicate adds)."""
-    monkeypatch.setattr(sync_mod.time, "sleep", lambda s: None)
-
+    """A 412 on a chunk add refreshes the ETag (_reparse) and retries just that chunk (no dupes)."""
+    _no_backoff(monkeypatch)
     added = []
     reparses = {"n": 0}
 
@@ -99,42 +61,50 @@ def test_add_tracks_retries_chunk_on_412_after_refreshing_etag(monkeypatch):
                 raise requests.exceptions.HTTPError(response=_Resp412())
             added.append(list(chunk))
 
-    asyncio.run(sync_mod._add_tracks_to_tidal_playlist(FakePlaylist(), [1, 2, 3, 4, 5], chunk_size=2))
+    asyncio.run(patch_mod.add_tracks_to_tidal_playlist(FakePlaylist(), [1, 2, 3, 4, 5], chunk_size=2))
 
     assert added == [[1, 2], [3, 4], [5]]   # [3,4] added once, after the refresh+retry
-    assert reparses["n"] >= 2               # initial seed + at least one 412-triggered refresh
+    assert reparses["n"] >= 1               # refreshed the ETag on the 412 before retrying
+
+
+def test_clear_tidal_playlist_removes_in_chunks(monkeypatch):
+    """clear loops the library's remove_by_indices in chunks until the playlist is empty."""
+    _no_backoff(monkeypatch)
+    removed = []
+
+    class FakePlaylist:
+        def __init__(self):
+            self.num_tracks = 13
+        def _reparse(self):
+            pass
+        def remove_by_indices(self, indices):
+            indices = list(indices)
+            removed.append(indices)
+            self.num_tracks -= len(indices)  # the library reparses after each delete, shrinking the list
+
+    asyncio.run(patch_mod.clear_tidal_playlist(FakePlaylist(), chunk_size=5))
+
+    assert [len(c) for c in removed] == [5, 5, 3]  # 13 tracks erased in chunks of 5
 
 
 def test_clear_tidal_playlist_retries_delete_on_412(monkeypatch):
     """A 412 on a delete chunk refreshes the ETag and retries the delete rather than aborting."""
-    monkeypatch.setattr(patch_mod.time, "sleep", lambda s: None)
-    events = []
-
-    class FakeRequest:
-        def __init__(self, pl):
-            self.pl = pl
-            self.deletes = 0
-        def request(self, method, url, headers=None):
-            self.deletes += 1
-            events.append(("DELETE", self.pl._etag))
-            if self.deletes == 1:  # first delete 412s, then succeeds after a reparse
-                raise requests.exceptions.HTTPError(response=_Resp412())
-            self.pl._pending = 0
+    _no_backoff(monkeypatch)
+    reparses = {"n": 0}
+    attempts = {"n": 0}
 
     class FakePlaylist:
-        _base_url = "playlists/%s"
         def __init__(self):
-            self.id = "p1"
-            self._etag = None
             self.num_tracks = 5
-            self._pending = 5
-            self.request = FakeRequest(self)
         def _reparse(self):
-            events.append(("reparse", self._etag))
-            self._etag = "fresh-etag"
-            self.num_tracks = self._pending
+            reparses["n"] += 1
+        def remove_by_indices(self, indices):
+            attempts["n"] += 1
+            if attempts["n"] == 1:  # first delete 412s, then succeeds after a refresh
+                raise requests.exceptions.HTTPError(response=_Resp412())
+            self.num_tracks -= len(list(indices))
 
-    clear_tidal_playlist(FakePlaylist())
+    asyncio.run(patch_mod.clear_tidal_playlist(FakePlaylist()))
 
-    deletes = [e for e in events if e[0] == "DELETE"]
-    assert len(deletes) == 2  # first 412'd, retried after refresh
+    assert attempts["n"] == 2  # first 412'd, retried after refresh
+    assert reparses["n"] >= 1

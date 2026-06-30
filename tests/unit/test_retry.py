@@ -12,6 +12,18 @@ class _Resp:
         self.text = "rate limited"
 
 
+def _record_sleeps(monkeypatch):
+    """Replace the asyncio.sleep that repeat_on_request_error awaits with a no-op that records the
+    requested delays, so backoff timing can be asserted without actually waiting."""
+    slept = []
+
+    async def fake_sleep(delay):
+        slept.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return slept
+
+
 def _failing_then_ok(exc):
     """Return an async function that raises `exc` on its first call, then succeeds."""
     state = {"calls": 0}
@@ -26,8 +38,7 @@ def _failing_then_ok(exc):
 
 
 def test_repeat_on_request_error_honors_retry_after(monkeypatch):
-    slept = []
-    monkeypatch.setattr(sync_mod.time, "sleep", lambda s: slept.append(s))
+    slept = _record_sleeps(monkeypatch)
 
     exc = requests.exceptions.RequestException(response=_Resp({"Retry-After": "7"}))
     fn, state = _failing_then_ok(exc)
@@ -40,8 +51,7 @@ def test_repeat_on_request_error_honors_retry_after(monkeypatch):
 
 
 def test_repeat_on_request_error_falls_back_to_schedule(monkeypatch):
-    slept = []
-    monkeypatch.setattr(sync_mod.time, "sleep", lambda s: slept.append(s))
+    slept = _record_sleeps(monkeypatch)
 
     exc = requests.exceptions.RequestException(response=_Resp({}))  # no Retry-After header
     fn, state = _failing_then_ok(exc)
@@ -53,8 +63,7 @@ def test_repeat_on_request_error_falls_back_to_schedule(monkeypatch):
 
 
 def test_repeat_on_request_error_does_not_retry_non_transient_4xx(monkeypatch):
-    slept = []
-    monkeypatch.setattr(sync_mod.time, "sleep", lambda s: slept.append(s))
+    slept = _record_sleeps(monkeypatch)
 
     class _Resp412:
         status_code = 412

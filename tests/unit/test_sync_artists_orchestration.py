@@ -231,7 +231,9 @@ def test_sync_artists_skips_already_followed(mocker):
 
 
 def test_sync_artists_add_retries_on_rate_limit(mocker):
-    mocker.patch.object(sync_mod.time, "sleep")  # don't actually sleep between retries
+    async def _no_sleep(delay):  # the retry backs off via asyncio.sleep; skip the real wait
+        pass
+    mocker.patch.object(asyncio, "sleep", _no_sleep)
     spotify_session = mock.MagicMock()
     spotify_session.current_user_followed_artists.return_value = _followed_page(
         [{"id": "sp1", "name": "Artist One"}]

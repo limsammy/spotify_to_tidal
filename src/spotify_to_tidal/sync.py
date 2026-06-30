@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import asyncio
-import time
 from typing import Callable, List, Optional, Sequence, Set, Mapping
 import requests
 import spotipy
@@ -10,7 +9,7 @@ from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
 
 from .cache import failure_cache, track_match_cache, album_match_cache, artist_match_cache
-from .tidalapi_patch import clear_tidal_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks, get_all_saved_albums, add_album_to_tidal_collection, get_all_saved_artists, add_artist_to_tidal_collection
+from .tidalapi_patch import clear_tidal_playlist, add_tracks_to_tidal_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks, get_all_saved_albums, add_album_to_tidal_collection, get_all_saved_artists, add_artist_to_tidal_collection
 from .matching import (
     normalize, simple, isrc_match, duration_match, name_match, artists_overlap, match,
     test_album_similarity, _names_match, album_match, artist_match,
@@ -145,8 +144,14 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
     task_description = "Searching Tidal for {}/{} tracks in Spotify playlist '{}'".format(len(tracks_to_search), len(spotify_tracks), playlist_name)
     semaphore = asyncio.Semaphore(config.get('max_concurrency', 10))
     rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore, config))
-    # return_exceptions so one track's non-retryable error doesn't abort the whole batch's search
-    search_results = await atqdm.gather( *[ repeat_on_request_error(tidal_search, t, semaphore, tidal_session) for t in tracks_to_search ], desc=task_description, return_exceptions=True )
+    # Isolate each search so one track's non-retryable error doesn't abort the whole batch (atqdm.gather
+    # has no return_exceptions; capture per task and let the loop below treat exceptions as a miss).
+    async def _search_one(spotify_track):
+        try:
+            return await repeat_on_request_error(tidal_search, spotify_track, semaphore, tidal_session)
+        except Exception as e:
+            return e
+    search_results = await atqdm.gather( *[ _search_one(t) for t in tracks_to_search ], desc=task_description )
     rate_limiter_task.cancel()
 
     # Add the search results to the cache
@@ -163,37 +168,6 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
             add_not_found_item('track', song_info, playlist_name)
             color = ('\033[91m', '\033[0m')
             print(color[0] + "Could not find the track " + song_info + color[1])
-
-
-async def _mutate_playlist_with_etag_retry(tidal_playlist, op: Callable, *args, attempts: int = 5):
-    """ Run an ETag-guarded Tidal playlist mutation (add/remove a chunk), refreshing the playlist's
-        ETag and retrying on 412 Precondition Failed. Tidal requires a current If-None-Match etag to
-        edit a playlist and can serve a stale one between consecutive writes (read-after-write lag),
-        so retrying with a freshly re-fetched etag succeeds. Rate-limit / transient errors continue
-        to flow through repeat_on_request_error. """
-    for attempt in range(attempts):
-        try:
-            return await repeat_on_request_error(asyncio.to_thread, op, *args)
-        except requests.exceptions.HTTPError as e:
-            status = getattr(getattr(e, 'response', None), 'status_code', None)
-            if status == 412 and attempt < attempts - 1:
-                time.sleep(1 + attempt)  # let Tidal settle, refresh the etag, then retry the same chunk
-                await asyncio.to_thread(tidal_playlist._reparse)
-                continue
-            raise
-
-async def _add_tracks_to_tidal_playlist(tidal_playlist: tidalapi.Playlist, track_ids: Sequence[int], chunk_size: int = 20):
-    """ Append tracks to a Tidal playlist in chunks. Each chunk is ETag-guarded: a 412 refreshes the
-        playlist ETag and retries just that chunk, and 429s retry per-chunk — so neither re-adds
-        earlier chunks. """
-    # Seed a current ETag before the first add (the custom chunk fetcher that loaded the playlist
-    # didn't populate _etag); _mutate_playlist_with_etag_retry refreshes it again on any 412.
-    await repeat_on_request_error(asyncio.to_thread, tidal_playlist._reparse)
-    with tqdm(desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
-        for offset in range(0, len(track_ids), chunk_size):
-            chunk = track_ids[offset:offset + chunk_size]
-            await _mutate_playlist_with_etag_retry(tidal_playlist, tidal_playlist.add, chunk)
-            progress.update(len(chunk))
 
 
 async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, spotify_playlist, tidal_playlist: tidalapi.Playlist | None, config: dict):
@@ -220,11 +194,11 @@ async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalap
         print("No changes to write to Tidal playlist")
     elif new_tidal_track_ids[:len(old_tidal_track_ids)] == old_tidal_track_ids:
         # Append new tracks to the existing playlist if possible
-        await _add_tracks_to_tidal_playlist(tidal_playlist, new_tidal_track_ids[len(old_tidal_track_ids):])
+        await add_tracks_to_tidal_playlist(tidal_playlist, new_tidal_track_ids[len(old_tidal_track_ids):])
     else:
         # Erase old playlist and add new tracks from scratch if any reordering occured
-        await repeat_on_request_error(asyncio.to_thread, clear_tidal_playlist, tidal_playlist)
-        await _add_tracks_to_tidal_playlist(tidal_playlist, new_tidal_track_ids)
+        await clear_tidal_playlist(tidal_playlist)
+        await add_tracks_to_tidal_playlist(tidal_playlist, new_tidal_track_ids)
 
 async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
     """ sync user favorites to tidal """
