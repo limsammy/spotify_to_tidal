@@ -236,17 +236,36 @@ async def repeat_on_request_error(function, *args, remaining=5, **kwargs):
         else:
             print(f"{str(e)} could not be recovered")
 
-        if isinstance(e, requests.exceptions.RequestException) and not e.response is None:
-            print(f"Response message: {e.response.text}")
-            print(f"Response headers: {e.response.headers}")
+        # Locate the underlying HTTP response, which may be on the exception directly
+        # (requests) or on the wrapped cause (tidalapi TooManyRequests)
+        response = getattr(e, 'response', None)
+        if response is None and getattr(e, '__cause__', None) is not None:
+            response = getattr(e.__cause__, 'response', None)
+        if response is not None:
+            print(f"Response message: {response.text}")
+            print(f"Response headers: {response.headers}")
 
         if not remaining:
             print("Aborting sync")
             print(f"The following arguments were provided:\n\n {str(args)}")
             print(traceback.format_exc())
             sys.exit(1)
-        sleep_schedule = {5: 1, 4:10, 3:60, 2:5*60, 1:10*60} # sleep variable length of time depending on retry number
-        time.sleep(sleep_schedule.get(remaining, 1))
+
+        # Honor the server's Retry-After header when present, otherwise fall back to the backoff schedule
+        retry_after = None
+        if response is not None:
+            retry_after_header = response.headers.get('Retry-After') or response.headers.get('retry-after')
+            if retry_after_header:
+                try:
+                    retry_after = int(retry_after_header)
+                except ValueError:
+                    retry_after = None
+        if retry_after is not None:
+            print(f"Waiting {retry_after} seconds (Retry-After header) before retrying")
+            time.sleep(retry_after)
+        else:
+            sleep_schedule = {5: 1, 4:10, 3:60, 2:5*60, 1:10*60} # sleep variable length of time depending on retry number
+            time.sleep(sleep_schedule.get(remaining, 1))
         return await repeat_on_request_error(function, *args, remaining=remaining-1, **kwargs)
 
 
