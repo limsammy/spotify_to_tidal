@@ -4,6 +4,7 @@ import sys
 
 from . import sync as _sync
 from . import auth as _auth
+from . import logfile as _logfile
 
 def main():
     parser = argparse.ArgumentParser()
@@ -49,7 +50,7 @@ def main():
         sys.exit("Could not connect to Tidal")
     
     # Clear any previous not found logs
-    _sync.clear_not_found_log()
+    _logfile.clear_not_found_log()
 
     # Resolve followed artists FIRST (when enabled) so the track/album syncs below can harvest their
     # Tidal ids for free from matched releases; the follow step itself happens after, in finish.
@@ -81,7 +82,7 @@ def main():
         _sync.finish_artist_sync_wrapper(spotify_session, tidal_session, config, *artist_ctx)
 
     # Write consolidated log of all items not found
-    _sync.write_not_found_log()
+    _logfile.write_not_found_log()
 
 if __name__ == '__main__':
     main()

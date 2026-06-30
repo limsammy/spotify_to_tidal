@@ -7,7 +7,7 @@ import os
 # Add the src directory to the path so we can import the modules
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
 
-from spotify_to_tidal.sync import add_not_found_item, write_not_found_log, clear_not_found_log
+from spotify_to_tidal.logfile import add_not_found_item, write_not_found_log, clear_not_found_log
 
 
 class TestConsolidatedLogging:
