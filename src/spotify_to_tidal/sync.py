@@ -11,7 +11,7 @@ import requests
 import sys
 import spotipy
 import tidalapi
-from .tidalapi_patch import add_multiple_tracks_to_playlist, clear_tidal_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks, get_all_saved_albums, add_album_to_tidal_collection, get_all_saved_artists, add_artist_to_tidal_collection
+from .tidalapi_patch import clear_tidal_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks, get_all_saved_albums, add_album_to_tidal_collection, get_all_saved_artists, add_artist_to_tidal_collection
 import time
 from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
@@ -393,7 +393,17 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
             color = ('\033[91m', '\033[0m')
             print(color[0] + "Could not find the track " + song_info + color[1])
 
-            
+
+async def _add_tracks_to_tidal_playlist(tidal_playlist: tidalapi.Playlist, track_ids: Sequence[int], chunk_size: int = 20):
+    """ Append tracks to a Tidal playlist in chunks, retrying each chunk on request errors.
+        Retrying per-chunk (rather than the whole append) avoids re-adding earlier chunks on a 429. """
+    with tqdm(desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
+        for offset in range(0, len(track_ids), chunk_size):
+            chunk = track_ids[offset:offset + chunk_size]
+            await repeat_on_request_error(asyncio.to_thread, tidal_playlist.add, chunk)
+            progress.update(len(chunk))
+
+
 async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, spotify_playlist, tidal_playlist: tidalapi.Playlist | None, config: dict):
     """ sync given playlist to tidal """
     # Get the tracks from both Spotify and Tidal, creating a new Tidal playlist if necessary
@@ -401,10 +411,10 @@ async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalap
     if len(spotify_tracks) == 0:
         return # nothing to do
     if tidal_playlist:
-        old_tidal_tracks = await get_all_playlist_tracks(tidal_playlist)
+        old_tidal_tracks = await repeat_on_request_error(get_all_playlist_tracks, tidal_playlist)
     else:
         print(f"No playlist found on Tidal corresponding to Spotify playlist: '{spotify_playlist['name']}', creating new playlist")
-        tidal_playlist =  tidal_session.user.create_playlist(spotify_playlist['name'], spotify_playlist['description'])
+        tidal_playlist = await repeat_on_request_error(asyncio.to_thread, tidal_session.user.create_playlist, spotify_playlist['name'], spotify_playlist['description'])
         old_tidal_tracks = []
 
     # Extract the new tracks from the playlist that we haven't already seen before
@@ -418,11 +428,11 @@ async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalap
         print("No changes to write to Tidal playlist")
     elif new_tidal_track_ids[:len(old_tidal_track_ids)] == old_tidal_track_ids:
         # Append new tracks to the existing playlist if possible
-        add_multiple_tracks_to_playlist(tidal_playlist, new_tidal_track_ids[len(old_tidal_track_ids):])
+        await _add_tracks_to_tidal_playlist(tidal_playlist, new_tidal_track_ids[len(old_tidal_track_ids):])
     else:
         # Erase old playlist and add new tracks from scratch if any reordering occured
-        clear_tidal_playlist(tidal_playlist)
-        add_multiple_tracks_to_playlist(tidal_playlist, new_tidal_track_ids)
+        await repeat_on_request_error(asyncio.to_thread, clear_tidal_playlist, tidal_playlist)
+        await _add_tracks_to_tidal_playlist(tidal_playlist, new_tidal_track_ids)
 
 async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
     """ sync user favorites to tidal """
@@ -444,7 +454,7 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
     print("Loading favorite tracks from Spotify")
     spotify_tracks = await get_tracks_from_spotify_favorites()
     print("Loading existing favorite tracks from Tidal")
-    old_tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE')
+    old_tidal_tracks = await repeat_on_request_error(get_all_favorites, tidal_session.user.favorites, order='DATE')
     populate_track_match_cache(spotify_tracks, old_tidal_tracks)
     await search_new_tracks_on_tidal(tidal_session, spotify_tracks, "Favorites", config)
     new_tidal_favorite_ids = get_new_tidal_favorites()
@@ -484,7 +494,7 @@ async def sync_albums(spotify_session: spotipy.Spotify, tidal_session: tidalapi.
     print("Loading saved albums from Spotify")
     spotify_albums = await get_albums_from_spotify_saved()
     print("Loading existing albums from Tidal")
-    old_tidal_albums = await get_all_saved_albums(tidal_session.user)
+    old_tidal_albums = await repeat_on_request_error(get_all_saved_albums, tidal_session.user)
     populate_album_match_cache(spotify_albums, old_tidal_albums, config)
     await search_new_albums_on_tidal(tidal_session, spotify_albums, config)
     new_tidal_album_ids = get_new_tidal_albums()
@@ -754,7 +764,7 @@ async def sync_artists(spotify_session: spotipy.Spotify, tidal_session: tidalapi
     print("Loading followed artists from Spotify")
     spotify_artists = await get_artists_from_spotify_followed()
     print("Loading existing followed artists from Tidal")
-    old_tidal_artists = await get_all_saved_artists(tidal_session.user)
+    old_tidal_artists = await repeat_on_request_error(get_all_saved_artists, tidal_session.user)
     populate_artist_match_cache(spotify_artists, old_tidal_artists, config)
     await search_new_artists_on_tidal(tidal_session, spotify_artists, config)
     new_tidal_artist_ids = get_new_tidal_artists()
@@ -822,7 +832,7 @@ def sync_artists_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidala
     asyncio.run(sync_artists(spotify_session, tidal_session, config))
 
 def get_tidal_playlists_wrapper(tidal_session: tidalapi.Session) -> Mapping[str, tidalapi.Playlist]:
-    tidal_playlists = asyncio.run(get_all_playlists(tidal_session.user))
+    tidal_playlists = asyncio.run(repeat_on_request_error(get_all_playlists, tidal_session.user))
     return {playlist.name: playlist for playlist in tidal_playlists}
 
 def pick_tidal_playlist_for_spotify_playlist(spotify_playlist, tidal_playlists: Mapping[str, tidalapi.Playlist]):
@@ -845,15 +855,15 @@ async def get_playlists_from_spotify(spotify_session: spotipy.Spotify, config):
     # get all the playlists from the Spotify account
     playlists = []
     print("Loading Spotify playlists")
-    first_results = spotify_session.current_user_playlists()
+    first_results = await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_playlists)
     exclude_list = set([x.split(':')[-1] for x in config.get('excluded_playlists', [])])
     playlists.extend([p for p in first_results['items']])
-    user_id = spotify_session.current_user()['id']
+    user_id = (await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user))['id']
 
     # get all the remaining playlists in parallel
     if first_results['next']:
         offsets = [ first_results['limit'] * n for n in range(1, math.ceil(first_results['total']/first_results['limit'])) ]
-        extra_results = await atqdm.gather( *[asyncio.to_thread(spotify_session.current_user_playlists, offset=offset) for offset in offsets ] )
+        extra_results = await atqdm.gather( *[repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_playlists, offset=offset) for offset in offsets ] )
         for extra_result in extra_results:
             playlists.extend([p for p in extra_result['items']])
 
