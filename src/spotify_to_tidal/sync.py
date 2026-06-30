@@ -415,6 +415,10 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
 async def _add_tracks_to_tidal_playlist(tidal_playlist: tidalapi.Playlist, track_ids: Sequence[int], chunk_size: int = 20):
     """ Append tracks to a Tidal playlist in chunks, retrying each chunk on request errors.
         Retrying per-chunk (rather than the whole append) avoids re-adding earlier chunks on a 429. """
+    # Refresh the playlist ETag before mutating: the custom chunk fetcher that loaded this playlist
+    # didn't populate _etag, so tidalapi's add() would send a stale If-None-Match and get 412.
+    # tidalapi.add() re-parses after each chunk, so only the first add needs this.
+    await repeat_on_request_error(asyncio.to_thread, tidal_playlist._reparse)
     with tqdm(desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
         for offset in range(0, len(track_ids), chunk_size):
             chunk = track_ids[offset:offset + chunk_size]

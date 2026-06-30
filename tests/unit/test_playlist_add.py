@@ -17,6 +17,11 @@ def test_add_tracks_retries_per_chunk_without_duplicates(monkeypatch):
     calls = {"n": 0}
 
     class FakePlaylist:
+        def __init__(self):
+            self.reparsed_before_first_add = None
+        def _reparse(self):
+            # records whether the ETag was refreshed before any add happened
+            self.reparsed_before_first_add = (len(added) == 0)
         def add(self, chunk):
             calls["n"] += 1
             # fail the first attempt at the second chunk, succeed on retry
@@ -24,8 +29,11 @@ def test_add_tracks_retries_per_chunk_without_duplicates(monkeypatch):
                 raise tidalapi.exceptions.TooManyRequests("rate limited")
             added.append(list(chunk))
 
-    asyncio.run(sync_mod._add_tracks_to_tidal_playlist(FakePlaylist(), [1, 2, 3, 4, 5], chunk_size=2))
+    pl = FakePlaylist()
+    asyncio.run(sync_mod._add_tracks_to_tidal_playlist(pl, [1, 2, 3, 4, 5], chunk_size=2))
 
+    # ETag refreshed before the first add (avoids the 412 on the add path)
+    assert pl.reparsed_before_first_add is True
     # every track added exactly once, in order — no duplicate of the [1, 2] chunk
     assert added == [[1, 2], [3, 4], [5]]
 
