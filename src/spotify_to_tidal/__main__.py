@@ -50,7 +50,13 @@ def main():
     
     # Clear any previous not found logs
     _sync.clear_not_found_log()
-    
+
+    # Resolve followed artists FIRST (when enabled) so the track/album syncs below can harvest their
+    # Tidal ids for free from matched releases; the follow step itself happens after, in finish.
+    artist_ctx = None
+    if sync_artists:
+        artist_ctx = _sync.prepare_artist_sync_wrapper(spotify_session, tidal_session, config)
+
     if sync_playlists:
         if args.uri:
             # if a playlist ID is explicitly provided as a command line argument then use that
@@ -67,13 +73,13 @@ def main():
 
     if sync_favorites:
         _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
-    
+
     if sync_albums:
         _sync.sync_albums_wrapper(spotify_session, tidal_session, config)
-    
+
     if sync_artists:
-        _sync.sync_artists_wrapper(spotify_session, tidal_session, config)
-    
+        _sync.finish_artist_sync_wrapper(spotify_session, tidal_session, config, *artist_ctx)
+
     # Write consolidated log of all items not found
     _sync.write_not_found_log()
 

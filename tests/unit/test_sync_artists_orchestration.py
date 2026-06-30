@@ -1,11 +1,10 @@
 # tests/unit/test_sync_artists_orchestration.py
 #
-# Orchestration-level tests for the followed-artist sync flow. The existing
-# test_artist_sync.py covers artist_match and the match cache in isolation;
-# these exercise the sync_artists / search_new_artists_on_tidal paths end to
-# end (fetch pagination, found / not-found, partial failure, add failure,
-# search error, wrapper). Test cases adapted from PR #138 (blackpr) to this
-# branch's function/module names and architecture.
+# Orchestration-level tests for the followed-artist sync flow. test_artist_sync.py covers
+# artist_match and the match cache in isolation; these exercise the prepare / finish /
+# resolve_residual_artists_on_tidal paths end to end: cursor pagination, the wanted-set
+# computation, release-grounded residual resolution (found / not found), full-sync success,
+# partial failure, skip-already-followed, add-retry, and the wrapper.
 
 import asyncio
 from unittest import mock
@@ -23,14 +22,22 @@ class DummyTidalArtist:
         self.name = name
 
 
+class DummyRelease:
+    """Stand-in for a matched tidalapi Track/Album: only .artists is read."""
+    def __init__(self, artists):
+        self.artists = artists
+
+
 @pytest.fixture(autouse=True)
 def _reset_global_state():
-    """Each test gets a clean match cache and not-found log."""
+    """Each test gets a clean match cache, not-found log, and empty wanted set."""
     artist_match_cache.data = {}
     sync_mod.clear_not_found_log()
+    sync_mod.set_wanted_artist_ids(set())
     yield
     artist_match_cache.data = {}
     sync_mod.clear_not_found_log()
+    sync_mod.set_wanted_artist_ids(set())
 
 
 def _followed_page(items, after=None, has_next=False):
@@ -48,24 +55,23 @@ def _config():
 
 
 # --------------------------------------------------------------------------
-# Fetching followed artists from Spotify (cursor pagination)
+# Fetching followed artists (cursor pagination), via the full sync_artists path
 # --------------------------------------------------------------------------
 
 def _run_sync_capturing_fetched(mocker, spotify_session):
-    """Run sync_artists with downstream stubbed out, returning the spotify
-    artists that reached search_new_artists_on_tidal."""
+    """Run sync_artists with the residual resolver stubbed out, returning the spotify artists
+    that reached resolve_residual_artists_on_tidal (i.e. what prepare fetched)."""
     captured = {"artists": None}
 
-    def _capture_search(tidal_session, spotify_artists, config):
+    def _capture_resolve(spotify_session, tidal_session, spotify_artists, config):
         captured["artists"] = list(spotify_artists)
 
     mocker.patch.object(sync_mod, "get_all_saved_artists", return_value=[])
-    mocker.patch.object(sync_mod, "search_new_artists_on_tidal", side_effect=_capture_search)
+    mocker.patch.object(sync_mod, "resolve_residual_artists_on_tidal", side_effect=_capture_resolve)
     mocker.patch.object(sync_mod, "add_artist_to_tidal_collection")
     mocker.patch.object(sync_mod, "tqdm", side_effect=lambda x, **kwargs: x)
 
-    tidal_session = mock.MagicMock()
-    asyncio.run(sync_mod.sync_artists(spotify_session, tidal_session, _config()))
+    asyncio.run(sync_mod.sync_artists(spotify_session, mock.MagicMock(), _config()))
     return captured["artists"]
 
 
@@ -86,8 +92,7 @@ def test_get_followed_artists_multiple_pages(mocker):
     spotify_session.current_user_followed_artists.side_effect = [
         _followed_page(
             [{"id": "a1", "name": "Artist One"}, {"id": "a2", "name": "Artist Two"}],
-            after="xyz",
-            has_next=True,
+            after="xyz", has_next=True,
         ),
         _followed_page([{"id": "a3", "name": "Artist Three"}]),
     ]
@@ -96,7 +101,6 @@ def test_get_followed_artists_multiple_pages(mocker):
 
     assert [a["id"] for a in fetched] == ["a1", "a2", "a3"]
     assert spotify_session.current_user_followed_artists.call_count == 2
-    # second page is requested with the cursor returned by the first
     assert spotify_session.current_user_followed_artists.call_args_list[1] == mock.call(limit=50, after="xyz")
 
 
@@ -105,51 +109,65 @@ def test_get_followed_artists_empty(mocker):
     spotify_session.current_user_followed_artists.return_value = _followed_page([])
 
     mocker.patch.object(sync_mod, "get_all_saved_artists", return_value=[])
-    mocker.patch.object(sync_mod, "search_new_artists_on_tidal")
+    mocker.patch.object(sync_mod, "resolve_residual_artists_on_tidal")
     mocker.patch.object(sync_mod, "tqdm", side_effect=lambda x, **kwargs: x)
     add_mock = mocker.patch.object(sync_mod, "add_artist_to_tidal_collection")
 
-    tidal_session = mock.MagicMock()
-    asyncio.run(sync_mod.sync_artists(spotify_session, tidal_session, _config()))
+    asyncio.run(sync_mod.sync_artists(spotify_session, mock.MagicMock(), _config()))
 
     add_mock.assert_not_called()
 
 
 # --------------------------------------------------------------------------
-# Searching for artists on Tidal (found / not found / search error)
+# prepare: wanted-set computation
 # --------------------------------------------------------------------------
 
-def test_search_new_artists_found():
-    tidal_session = mock.MagicMock()
-    tidal_session.search.return_value = {"artists": [DummyTidalArtist(101, "Artist One")]}
+def test_prepare_excludes_already_followed_from_wanted(mocker):
+    spotify_session = mock.MagicMock()
+    spotify_session.current_user_followed_artists.return_value = _followed_page(
+        [{"id": "sp1", "name": "Artist One"}, {"id": "sp2", "name": "Artist Two"}]
+    )
+    mocker.patch.object(sync_mod, "get_all_saved_artists", return_value=[DummyTidalArtist(101, "Artist One")])
 
-    spotify_artists = [{"id": "sp1", "name": "Artist One"}]
-    asyncio.run(sync_mod.search_new_artists_on_tidal(tidal_session, spotify_artists, _config()))
+    sync_mod.prepare_artist_sync_wrapper(spotify_session, mock.MagicMock(), _config())
 
+    # sp1 already followed on Tidal -> resolved into the cache and excluded from `wanted`
     assert artist_match_cache.get("sp1") == 101
+    assert sync_mod._wanted_artist_ids == {"sp2"}
 
 
-def test_search_new_artists_not_found():
-    tidal_session = mock.MagicMock()
-    tidal_session.search.return_value = {"artists": []}
+# --------------------------------------------------------------------------
+# resolve_residual_artists_on_tidal: release-grounded (replaces the old name search)
+# --------------------------------------------------------------------------
 
-    spotify_artists = [{"id": "sp1", "name": "Nonexistent Artist"}]
-    asyncio.run(sync_mod.search_new_artists_on_tidal(tidal_session, spotify_artists, _config()))
-
-    assert artist_match_cache.get("sp1") is None
-    assert any(item["type"] == "artist" and "Nonexistent Artist" in item["info"]
-               for item in sync_mod._not_found_items)
-
-
-def test_search_new_artists_search_error_is_handled():
-    tidal_session = mock.MagicMock()
-    tidal_session.search.side_effect = Exception("Search Error")
+def test_resolve_residual_grounds_artist_via_top_track(mocker):
+    sync_mod.set_wanted_artist_ids({"sp1"})
+    spotify_session = mock.MagicMock()
+    top_track = {"id": "t1", "name": "Song", "artists": [{"id": "sp1", "name": "Artist One"}]}
+    spotify_session.artist_top_tracks.return_value = {"tracks": [top_track]}
+    # the top track matches a real Tidal track whose artist (id 901) is the grounded answer
+    mocker.patch.object(sync_mod, "tidal_search",
+                        new=mock.AsyncMock(return_value=DummyRelease([DummyTidalArtist(901, "Artist One")])))
 
     spotify_artists = [{"id": "sp1", "name": "Artist One"}]
-    # Non-retryable errors inside the search are swallowed -> treated as not found, no crash
-    asyncio.run(sync_mod.search_new_artists_on_tidal(tidal_session, spotify_artists, _config()))
+    asyncio.run(sync_mod.resolve_residual_artists_on_tidal(spotify_session, mock.MagicMock(), spotify_artists, _config()))
 
-    assert artist_match_cache.get("sp1") is None
+    assert artist_match_cache.get("sp1") == 901  # id read off the matched release, not a name guess
+
+
+def test_resolve_residual_logs_and_skips_when_no_top_track_matches(mocker):
+    sync_mod.set_wanted_artist_ids({"sp1"})
+    spotify_session = mock.MagicMock()
+    spotify_session.artist_top_tracks.return_value = {
+        "tracks": [{"id": "t1", "name": "Song", "artists": [{"id": "sp1", "name": "Artist One"}]}]
+    }
+    mocker.patch.object(sync_mod, "tidal_search", new=mock.AsyncMock(return_value=None))  # nothing matches
+
+    spotify_artists = [{"id": "sp1", "name": "Artist One"}]
+    asyncio.run(sync_mod.resolve_residual_artists_on_tidal(spotify_session, mock.MagicMock(), spotify_artists, _config()))
+
+    assert artist_match_cache.get("sp1") is None  # ungrounded -> not resolved
+    assert any(i["type"] == "artist" and i["info"] == "Artist One" for i in sync_mod._not_found_items)
 
 
 # --------------------------------------------------------------------------
@@ -157,16 +175,16 @@ def test_search_new_artists_search_error_is_handled():
 # --------------------------------------------------------------------------
 
 def _patch_sync_artists(mocker, found_map, existing_tidal=None):
-    """Stub get_all_saved_artists + search so that artists in found_map get a
-    cache entry (spotify_id -> tidal_id) as if found on Tidal."""
+    """Stub get_all_saved_artists + the residual resolver so that artists in found_map get a
+    cache entry (spotify_id -> tidal_id) as if grounded on Tidal."""
     mocker.patch.object(sync_mod, "get_all_saved_artists", return_value=existing_tidal or [])
 
-    def _search(tidal_session, spotify_artists, config):
+    def _resolve(spotify_session, tidal_session, spotify_artists, config):
         for artist in spotify_artists:
-            if artist["id"] in found_map:
+            if artist["id"] in found_map and not artist_match_cache.get(artist["id"]):
                 artist_match_cache.insert((artist["id"], found_map[artist["id"]]))
 
-    mocker.patch.object(sync_mod, "search_new_artists_on_tidal", side_effect=_search)
+    mocker.patch.object(sync_mod, "resolve_residual_artists_on_tidal", side_effect=_resolve)
     mocker.patch.object(sync_mod, "tqdm", side_effect=lambda x, **kwargs: x)
 
 
@@ -189,8 +207,7 @@ def test_sync_artists_partial_failure(mocker):
     spotify_session.current_user_followed_artists.return_value = _followed_page(
         [{"id": "sp1", "name": "Artist One"}, {"id": "sp2", "name": "Nonexistent Artist"}]
     )
-    # only sp1 is found on Tidal
-    _patch_sync_artists(mocker, found_map={"sp1": 101})
+    _patch_sync_artists(mocker, found_map={"sp1": 101})  # only sp1 can be grounded
 
     tidal_session = mock.MagicMock()
     asyncio.run(sync_mod.sync_artists(spotify_session, tidal_session, _config()))
@@ -203,7 +220,7 @@ def test_sync_artists_skips_already_followed(mocker):
     spotify_session.current_user_followed_artists.return_value = _followed_page(
         [{"id": "sp1", "name": "Artist One"}]
     )
-    # found on Tidal as id 101, but already in the user's Tidal favorites
+    # already followed on Tidal (id 101) -> resolved in prepare, excluded from wanted, not re-followed
     _patch_sync_artists(mocker, found_map={"sp1": 101}, existing_tidal=[DummyTidalArtist(101, "Artist One")])
 
     tidal_session = mock.MagicMock()
@@ -213,8 +230,6 @@ def test_sync_artists_skips_already_followed(mocker):
 
 
 def test_sync_artists_add_retries_on_rate_limit(mocker):
-    # Follow calls go through repeat_on_request_error: a transient rate-limit
-    # error is retried with backoff rather than aborting the run.
     mocker.patch.object(sync_mod.time, "sleep")  # don't actually sleep between retries
     spotify_session = mock.MagicMock()
     spotify_session.current_user_followed_artists.return_value = _followed_page(
@@ -235,8 +250,6 @@ def test_sync_artists_add_retries_on_rate_limit(mocker):
 
 
 def test_sync_artists_add_non_retryable_error_propagates(mocker):
-    # Non request/rate-limit errors are not caught by repeat_on_request_error,
-    # so a genuine bug while following an artist still surfaces.
     spotify_session = mock.MagicMock()
     spotify_session.current_user_followed_artists.return_value = _followed_page(
         [{"id": "sp1", "name": "Artist One"}]
