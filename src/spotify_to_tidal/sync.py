@@ -412,17 +412,34 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
             print(color[0] + "Could not find the track " + song_info + color[1])
 
 
+async def _mutate_playlist_with_etag_retry(tidal_playlist, op: Callable, *args, attempts: int = 5):
+    """ Run an ETag-guarded Tidal playlist mutation (add/remove a chunk), refreshing the playlist's
+        ETag and retrying on 412 Precondition Failed. Tidal requires a current If-None-Match etag to
+        edit a playlist and can serve a stale one between consecutive writes (read-after-write lag),
+        so retrying with a freshly re-fetched etag succeeds. Rate-limit / transient errors continue
+        to flow through repeat_on_request_error. """
+    for attempt in range(attempts):
+        try:
+            return await repeat_on_request_error(asyncio.to_thread, op, *args)
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status == 412 and attempt < attempts - 1:
+                time.sleep(1 + attempt)  # let Tidal settle, refresh the etag, then retry the same chunk
+                await asyncio.to_thread(tidal_playlist._reparse)
+                continue
+            raise
+
 async def _add_tracks_to_tidal_playlist(tidal_playlist: tidalapi.Playlist, track_ids: Sequence[int], chunk_size: int = 20):
-    """ Append tracks to a Tidal playlist in chunks, retrying each chunk on request errors.
-        Retrying per-chunk (rather than the whole append) avoids re-adding earlier chunks on a 429. """
-    # Refresh the playlist ETag before mutating: the custom chunk fetcher that loaded this playlist
-    # didn't populate _etag, so tidalapi's add() would send a stale If-None-Match and get 412.
-    # tidalapi.add() re-parses after each chunk, so only the first add needs this.
+    """ Append tracks to a Tidal playlist in chunks. Each chunk is ETag-guarded: a 412 refreshes the
+        playlist ETag and retries just that chunk, and 429s retry per-chunk — so neither re-adds
+        earlier chunks. """
+    # Seed a current ETag before the first add (the custom chunk fetcher that loaded the playlist
+    # didn't populate _etag); _mutate_playlist_with_etag_retry refreshes it again on any 412.
     await repeat_on_request_error(asyncio.to_thread, tidal_playlist._reparse)
     with tqdm(desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
         for offset in range(0, len(track_ids), chunk_size):
             chunk = track_ids[offset:offset + chunk_size]
-            await repeat_on_request_error(asyncio.to_thread, tidal_playlist.add, chunk)
+            await _mutate_playlist_with_etag_retry(tidal_playlist, tidal_playlist.add, chunk)
             progress.update(len(chunk))
 
 

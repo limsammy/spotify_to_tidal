@@ -2,10 +2,18 @@
 
 import asyncio
 
+import requests
 import tidalapi
 
 from spotify_to_tidal import sync as sync_mod
+from spotify_to_tidal import tidalapi_patch as patch_mod
 from spotify_to_tidal.tidalapi_patch import clear_tidal_playlist
+
+
+class _Resp412:
+    status_code = 412
+    text = "precondition failed"
+    headers = {}
 
 
 def test_add_tracks_retries_per_chunk_without_duplicates(monkeypatch):
@@ -71,3 +79,62 @@ def test_clear_tidal_playlist_refreshes_etag_before_first_delete():
     assert events[0] == ("reparse", None)  # refreshed the ETag before anything else
     deletes = [e for e in events if e[0] == "DELETE"]
     assert deletes and deletes[0][1] == {"If-None-Match": "fresh-etag"}  # delete used the fresh ETag
+
+
+def test_add_tracks_retries_chunk_on_412_after_refreshing_etag(monkeypatch):
+    """A 412 on a chunk add refreshes the ETag and retries just that chunk (no duplicate adds)."""
+    monkeypatch.setattr(sync_mod.time, "sleep", lambda s: None)
+
+    added = []
+    reparses = {"n": 0}
+
+    class FakePlaylist:
+        def __init__(self):
+            self._calls = 0
+        def _reparse(self):
+            reparses["n"] += 1
+        def add(self, chunk):
+            self._calls += 1
+            if list(chunk) == [3, 4] and self._calls == 2:  # 412 on first attempt of this chunk
+                raise requests.exceptions.HTTPError(response=_Resp412())
+            added.append(list(chunk))
+
+    asyncio.run(sync_mod._add_tracks_to_tidal_playlist(FakePlaylist(), [1, 2, 3, 4, 5], chunk_size=2))
+
+    assert added == [[1, 2], [3, 4], [5]]   # [3,4] added once, after the refresh+retry
+    assert reparses["n"] >= 2               # initial seed + at least one 412-triggered refresh
+
+
+def test_clear_tidal_playlist_retries_delete_on_412(monkeypatch):
+    """A 412 on a delete chunk refreshes the ETag and retries the delete rather than aborting."""
+    monkeypatch.setattr(patch_mod.time, "sleep", lambda s: None)
+    events = []
+
+    class FakeRequest:
+        def __init__(self, pl):
+            self.pl = pl
+            self.deletes = 0
+        def request(self, method, url, headers=None):
+            self.deletes += 1
+            events.append(("DELETE", self.pl._etag))
+            if self.deletes == 1:  # first delete 412s, then succeeds after a reparse
+                raise requests.exceptions.HTTPError(response=_Resp412())
+            self.pl._pending = 0
+
+    class FakePlaylist:
+        _base_url = "playlists/%s"
+        def __init__(self):
+            self.id = "p1"
+            self._etag = None
+            self.num_tracks = 5
+            self._pending = 5
+            self.request = FakeRequest(self)
+        def _reparse(self):
+            events.append(("reparse", self._etag))
+            self._etag = "fresh-etag"
+            self.num_tracks = self._pending
+
+    clear_tidal_playlist(FakePlaylist())
+
+    deletes = [e for e in events if e[0] == "DELETE"]
+    assert len(deletes) == 2  # first 412'd, retried after refresh

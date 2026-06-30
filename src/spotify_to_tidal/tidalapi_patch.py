@@ -1,15 +1,29 @@
 import asyncio
 import math
+import time
 from typing import List
+import requests
 import tidalapi
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
-def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List[int]):
-    # only send the If-None-Match precondition when we actually have a current ETag (matches tidalapi)
-    headers = {'If-None-Match': playlist._etag} if playlist._etag else None
+def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List[int], attempts: int=5):
     index_string = ",".join(map(str, indices))
-    playlist.request.request('DELETE', (playlist._base_url + '/items/%s') % (playlist.id, index_string), headers=headers)
+    url = (playlist._base_url + '/items/%s') % (playlist.id, index_string)
+    for attempt in range(attempts):
+        # only send the If-None-Match precondition when we have a current ETag (matches tidalapi)
+        headers = {'If-None-Match': playlist._etag} if playlist._etag else None
+        try:
+            playlist.request.request('DELETE', url, headers=headers)
+            break
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status == 412 and attempt < attempts - 1:
+                # Tidal serves a stale ETag between consecutive writes; refresh it and retry the chunk
+                time.sleep(1 + attempt)
+                playlist._reparse()
+                continue
+            raise
     playlist._reparse()
 
 def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
