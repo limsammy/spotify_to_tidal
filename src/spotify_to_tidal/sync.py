@@ -1,37 +1,25 @@
 #!/usr/bin/env python3
 
 import asyncio
-from .cache import failure_cache, track_match_cache, album_match_cache, artist_match_cache
-import datetime
-from difflib import SequenceMatcher
-from email.utils import parsedate_to_datetime
-from functools import partial
+import time
 from typing import Callable, List, Optional, Sequence, Set, Mapping
-import math
 import requests
-import sys
 import spotipy
 import tidalapi
+from tqdm.asyncio import tqdm as atqdm
+from tqdm import tqdm
+
+from .cache import failure_cache, track_match_cache, album_match_cache, artist_match_cache
 from .tidalapi_patch import clear_tidal_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks, get_all_saved_albums, add_album_to_tidal_collection, get_all_saved_artists, add_artist_to_tidal_collection
-# matching helpers live in matching.py; re-exported here so existing imports keep working
 from .matching import (
     normalize, simple, isrc_match, duration_match, name_match, artists_overlap, match,
     test_album_similarity, _names_match, album_match, artist_match,
 )
-# request-resilience + Spotify read helpers now live in their own modules; re-exported for
-# backward-compatible imports (tests and callers still import these from .sync)
 from .ratelimit import repeat_on_request_error, _run_rate_limiter
 from .spotify_api import (
     _fetch_all_from_spotify_in_chunks, get_tracks_from_spotify_playlist,
     get_followed_artists_from_spotify, get_playlists_from_spotify,
 )
-import time
-from tqdm.asyncio import tqdm as atqdm
-from tqdm import tqdm
-import traceback
-import unicodedata
-import math
-
 from .type import spotify as t_spotify
 
 # Global list to track all items not found during sync
