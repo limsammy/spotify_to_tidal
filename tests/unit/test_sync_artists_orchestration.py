@@ -10,6 +10,7 @@ import asyncio
 from unittest import mock
 
 import pytest
+import requests
 import tidalapi
 
 from spotify_to_tidal import sync as sync_mod
@@ -262,6 +263,34 @@ def test_sync_artists_add_non_retryable_error_propagates(mocker):
     with pytest.raises(ValueError, match="boom"):
         asyncio.run(sync_mod.sync_artists(spotify_session, tidal_session, _config()))
     tidal_session.user.favorites.add_artist.assert_called_once_with(101)
+
+
+def test_sync_artists_follow_continues_on_per_item_http_error(mocker):
+    # one artist's follow returns 404 (e.g. invalid/region-unavailable id) — it must be logged and
+    # skipped, not abort the whole follow batch.
+    spotify_session = mock.MagicMock()
+    spotify_session.current_user_followed_artists.return_value = _followed_page(
+        [{"id": "sp1", "name": "Artist One"}, {"id": "sp2", "name": "Artist Two"}]
+    )
+    _patch_sync_artists(mocker, found_map={"sp1": 101, "sp2": 202})
+
+    class _Resp404:
+        status_code = 404
+        text = "not found"
+        headers = {}
+
+    def _add(artist_id):
+        if artist_id == 101:
+            raise requests.exceptions.HTTPError(response=_Resp404())
+
+    tidal_session = mock.MagicMock()
+    tidal_session.user.favorites.add_artist.side_effect = _add
+
+    asyncio.run(sync_mod.sync_artists(spotify_session, tidal_session, _config()))
+
+    # both follows attempted (the 404 on 101 didn't abort the batch); 101 logged as not-found
+    assert tidal_session.user.favorites.add_artist.call_count == 2
+    assert any(i["type"] == "artist" and "101" in i["info"] for i in sync_mod._not_found_items)
 
 
 def test_sync_artists_wrapper(mocker):

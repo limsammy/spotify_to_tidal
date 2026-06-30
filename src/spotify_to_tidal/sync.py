@@ -501,7 +501,11 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
         async def _add_favorite(tidal_id):
             return await asyncio.to_thread(tidal_session.user.favorites.add_track, tidal_id)
         for tidal_id in tqdm(new_tidal_favorite_ids, desc="Adding new tracks to Tidal favorites"):
-            await repeat_on_request_error(_add_favorite, tidal_id)
+            try:
+                await repeat_on_request_error(_add_favorite, tidal_id)
+            except (requests.exceptions.RequestException, spotipy.exceptions.SpotifyException) as e:
+                # a single bad/unavailable id shouldn't abort the whole batch — log and continue
+                add_not_found_item('track', f"Failed to favorite Tidal track {tidal_id}: {e}")
     else:
         print("No new tracks to add to Tidal favorites")
 
@@ -542,7 +546,11 @@ async def sync_albums(spotify_session: spotipy.Spotify, tidal_session: tidalapi.
         async def _add_album(tidal_id):
             return await asyncio.to_thread(add_album_to_tidal_collection, tidal_session, tidal_id)
         for tidal_id in tqdm(new_tidal_album_ids, desc="Adding new albums to Tidal"):
-            await repeat_on_request_error(_add_album, tidal_id)
+            try:
+                await repeat_on_request_error(_add_album, tidal_id)
+            except (requests.exceptions.RequestException, spotipy.exceptions.SpotifyException) as e:
+                # a single bad/unavailable id shouldn't abort the whole batch — log and continue
+                add_not_found_item('album', f"Failed to add Tidal album {tidal_id}: {e}")
     else:
         print("No new albums to add to Tidal")
 
@@ -898,7 +906,11 @@ async def finish_artist_sync(spotify_session: spotipy.Spotify, tidal_session: ti
         async def _add_artist(tidal_id):
             return await asyncio.to_thread(add_artist_to_tidal_collection, tidal_session, tidal_id)
         for tidal_id in tqdm(new_tidal_artist_ids, desc="Following new artists on Tidal"):
-            await repeat_on_request_error(_add_artist, tidal_id)
+            try:
+                await repeat_on_request_error(_add_artist, tidal_id)
+            except (requests.exceptions.RequestException, spotipy.exceptions.SpotifyException) as e:
+                # a single bad/unavailable artist id (e.g. 404) shouldn't abort the whole batch
+                add_not_found_item('artist', f"Failed to follow Tidal artist {tidal_id}: {e}")
     else:
         print("No new artists to follow on Tidal")
 
