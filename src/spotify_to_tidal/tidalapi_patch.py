@@ -11,7 +11,6 @@ def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List
     index_string = ",".join(map(str, indices))
     url = (playlist._base_url + '/items/%s') % (playlist.id, index_string)
     for attempt in range(attempts):
-        # only send the If-None-Match precondition when we have a current ETag (matches tidalapi)
         headers = {'If-None-Match': playlist._etag} if playlist._etag else None
         try:
             playlist.request.request('DELETE', url, headers=headers)
@@ -19,7 +18,7 @@ def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List
         except requests.exceptions.HTTPError as e:
             status = getattr(getattr(e, 'response', None), 'status_code', None)
             if status == 412 and attempt < attempts - 1:
-                # Tidal serves a stale ETag between consecutive writes; refresh it and retry the chunk
+                # Tidal serves a stale ETag between consecutive writes; refresh it and retry
                 time.sleep(1 + attempt)
                 playlist._reparse()
                 continue
@@ -27,9 +26,7 @@ def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List
     playlist._reparse()
 
 def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
-    # Refresh the playlist so its ETag matches Tidal's current state. The custom chunk fetcher used to
-    # load playlist tracks doesn't populate _etag, so without this the first DELETE sends a stale (or
-    # missing) If-None-Match precondition and Tidal rejects it with 412 Precondition Failed.
+    # the chunk fetcher that loads tracks leaves _etag unset; refresh it or the first DELETE 412s
     playlist._reparse()
     with tqdm(desc="Erasing existing tracks from Tidal playlist", total=playlist.num_tracks) as progress:
         while playlist.num_tracks:
@@ -43,7 +40,9 @@ async def _get_all_chunks(url, session, parser, params={}) -> List[tidalapi.Trac
         The main library doesn't provide the total number of items or expose the raw json, so use this wrapper instead
     """
     def _make_request(offset: int=0):
-        new_params = params
+        # copy per call: these run concurrently via asyncio.to_thread and would otherwise race on
+        # the shared params dict (and mutate the caller's / the default dict)
+        new_params = dict(params)
         new_params['offset'] = offset
         return session.request.map_request(url, params=new_params)
 
