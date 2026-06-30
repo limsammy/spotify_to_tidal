@@ -6,12 +6,17 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
 def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List[int]):
-    headers = {'If-None-Match': playlist._etag}
+    # only send the If-None-Match precondition when we actually have a current ETag (matches tidalapi)
+    headers = {'If-None-Match': playlist._etag} if playlist._etag else None
     index_string = ",".join(map(str, indices))
     playlist.request.request('DELETE', (playlist._base_url + '/items/%s') % (playlist.id, index_string), headers=headers)
     playlist._reparse()
 
 def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
+    # Refresh the playlist so its ETag matches Tidal's current state. The custom chunk fetcher used to
+    # load playlist tracks doesn't populate _etag, so without this the first DELETE sends a stale (or
+    # missing) If-None-Match precondition and Tidal rejects it with 412 Precondition Failed.
+    playlist._reparse()
     with tqdm(desc="Erasing existing tracks from Tidal playlist", total=playlist.num_tracks) as progress:
         while playlist.num_tracks:
             indices = range(min(playlist.num_tracks, chunk_size))
