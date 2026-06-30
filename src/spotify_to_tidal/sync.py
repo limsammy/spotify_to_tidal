@@ -18,6 +18,13 @@ from .matching import (
     normalize, simple, isrc_match, duration_match, name_match, artists_overlap, match,
     test_album_similarity, _names_match, album_match, artist_match,
 )
+# request-resilience + Spotify read helpers now live in their own modules; re-exported for
+# backward-compatible imports (tests and callers still import these from .sync)
+from .ratelimit import repeat_on_request_error, _run_rate_limiter
+from .spotify_api import (
+    _fetch_all_from_spotify_in_chunks, get_tracks_from_spotify_playlist,
+    get_followed_artists_from_spotify, get_playlists_from_spotify,
+)
 import time
 from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
@@ -126,85 +133,6 @@ async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Sess
     # if none of the search modes succeeded then store the track id to the failure cache
     failure_cache.cache_match_failure(spotify_track['id'])
 
-async def repeat_on_request_error(function, *args, remaining=5, **kwargs):
-    # utility to repeat calling the function up to 5 times if an exception is thrown
-    try:
-        return await function(*args, **kwargs)
-    except (tidalapi.exceptions.TooManyRequests, requests.exceptions.RequestException, spotipy.exceptions.SpotifyException) as e:
-        # Locate the underlying HTTP response, which may be on the exception directly
-        # (requests) or on the wrapped cause (tidalapi TooManyRequests)
-        response = getattr(e, 'response', None)
-        if response is None and getattr(e, '__cause__', None) is not None:
-            response = getattr(e.__cause__, 'response', None)
-
-        # Only retry transient failures: rate limits (429), server errors (5xx), and
-        # connection/timeout errors (no HTTP status). Other 4xx (e.g. 412 precondition,
-        # 400/403/404) won't recover by retrying, so fail fast instead of burning the backoff.
-        status = getattr(response, 'status_code', None)
-        if status is None:
-            status = getattr(e, 'http_status', None)  # spotipy.SpotifyException
-        is_rate_limit = isinstance(e, tidalapi.exceptions.TooManyRequests) or status == 429
-        retryable = is_rate_limit or status is None or status >= 500
-        if not retryable:
-            print(f"{str(e)} is not retryable (HTTP {status}); aborting without retry")
-            if response is not None:
-                print(f"Response message: {response.text}")
-            raise
-
-        if remaining:
-            print(f"{str(e)} occurred, retrying {remaining} times")
-        else:
-            print(f"{str(e)} could not be recovered")
-
-        if response is not None:
-            print(f"Response message: {response.text}")
-            print(f"Response headers: {response.headers}")
-
-        if not remaining:
-            print("Aborting sync")
-            print(f"The following arguments were provided:\n\n {str(args)}")
-            print(traceback.format_exc())
-            sys.exit(1)
-
-        # Honor the server's Retry-After header when present, otherwise fall back to the backoff schedule
-        retry_after = None
-        if response is not None:
-            retry_after_header = response.headers.get('Retry-After') or response.headers.get('retry-after')
-            if retry_after_header:
-                try:
-                    retry_after = int(retry_after_header)
-                except ValueError:
-                    # Retry-After may also be an HTTP-date (RFC 7231); convert it to a delay in seconds
-                    try:
-                        retry_dt = parsedate_to_datetime(retry_after_header)
-                        delay = (retry_dt - datetime.datetime.now(retry_dt.tzinfo)).total_seconds()
-                        retry_after = max(0, int(delay))
-                    except (TypeError, ValueError):
-                        retry_after = None
-        if retry_after is not None:
-            print(f"Waiting {retry_after} seconds (Retry-After header) before retrying")
-            await asyncio.sleep(retry_after)
-        else:
-            sleep_schedule = {5: 1, 4:10, 3:60, 2:5*60, 1:10*60} # sleep variable length of time depending on retry number
-            await asyncio.sleep(sleep_schedule.get(remaining, 1))
-        return await repeat_on_request_error(function, *args, remaining=remaining-1, **kwargs)
-
-
-async def _run_rate_limiter(semaphore: asyncio.Semaphore, config: dict):
-    ''' Leaky bucket algorithm for rate limiting. Periodically releases items from semaphore at rate_limit'''
-    # treat an absent/zero/negative rate_limit as the default to avoid division by zero
-    rate_limit = config.get('rate_limit', 10) or 10
-    _sleep_time = config.get('max_concurrency', 10)/rate_limit/4 # aim to sleep approx time to drain 1/4 of 'bucket'
-    t0 = datetime.datetime.now()
-    while True:
-        await asyncio.sleep(_sleep_time)
-        t = datetime.datetime.now()
-        dt = (t - t0).total_seconds()
-        new_items = round(rate_limit*dt)
-        t0 = t
-        [semaphore.release() for _ in range(new_items)] # leak new_items from the 'bucket'
-
-
 async def _add_items_to_tidal(tidal_ids: Sequence, desc: str, add_fn: Callable, item_type: str):
     """ Add each Tidal id via add_fn(tidal_id), retrying transient errors. A single bad/unavailable id
         (e.g. a 404) is logged and skipped rather than aborting the whole batch. """
@@ -216,39 +144,6 @@ async def _add_items_to_tidal(tidal_ids: Sequence, desc: str, add_fn: Callable, 
         except (requests.exceptions.RequestException, spotipy.exceptions.SpotifyException) as e:
             add_not_found_item(item_type, f"Failed to add Tidal {item_type} {tidal_id}: {e}")
 
-
-async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable, item_key: str = "track") -> List[dict]:
-    output = []
-    results = fetch_function(0)
-    output.extend([item[item_key] for item in results['items'] if item.get(item_key) is not None])
-
-    # Get all the remaining items in parallel
-    if results['next']:
-        offsets = [results['limit'] * n for n in range(1, math.ceil(results['total'] / results['limit']))]
-        extra_results = await atqdm.gather(
-            *[asyncio.to_thread(fetch_function, offset) for offset in offsets],
-            desc="Fetching additional data chunks"
-        )
-        for extra_result in extra_results:
-            output.extend([item[item_key] for item in extra_result['items'] if item.get(item_key) is not None])
-
-    return output
-
-
-async def get_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, spotify_playlist):
-    def _get_tracks_from_spotify_playlist(offset: int, playlist_id: str):
-        fields = "next,total,limit,items(track(name,album(name,artists(id,name)),artists(id,name),track_number,duration_ms,id,external_ids(isrc))),type"
-        return spotify_session.playlist_tracks(playlist_id=playlist_id, fields=fields, offset=offset)
-
-    print(f"Loading tracks from Spotify playlist '{spotify_playlist['name']}'")
-    items = await repeat_on_request_error( _fetch_all_from_spotify_in_chunks, lambda offset: _get_tracks_from_spotify_playlist(offset=offset, playlist_id=spotify_playlist["id"]))
-    track_filter = lambda item: item.get('type', 'track') == 'track' # type may be 'episode' also
-    sanity_filter = lambda item: ('album' in item
-                                  and 'name' in item['album']
-                                  and 'artists' in item['album']
-                                  and len(item['album']['artists']) > 0
-                                  and item['album']['artists'][0]['name'] is not None)
-    return list(filter(sanity_filter, filter(track_filter, items)))
 
 def populate_track_match_cache(spotify_tracks_: Sequence[t_spotify.SpotifyTrack], tidal_tracks_: Sequence[tidalapi.Track], config: Optional[dict] = None):
     """ Populate the track match cache with all the existing tracks in Tidal playlist corresponding to Spotify playlist """
@@ -674,29 +569,6 @@ async def search_new_albums_on_tidal(tidal_session: tidalapi.Session, spotify_al
             color = ('\033[91m', '\033[0m')
             print(color[0] + "Could not find album " + album_info + color[1])
 
-async def get_followed_artists_from_spotify(spotify_session: spotipy.Spotify) -> List[dict]:
-    """ Fetch all artists the user follows on Spotify (cursor-paginated). """
-    async def _fetch_all_artists_from_spotify_in_chunks(fetch_function: Callable) -> List[dict]:
-        output = []
-        results = fetch_function(limit=50)
-        if results and 'artists' in results:
-            output.extend([item for item in results['artists']['items'] if item is not None])
-
-            # Handle pagination
-            while results['artists']['next']:
-                after = results['artists']['cursors']['after']
-                if not after:
-                    break  # no cursor to advance with; stop rather than re-requesting the same page
-                results = fetch_function(limit=50, after=after)
-                if results and 'artists' in results:
-                    output.extend([item for item in results['artists']['items'] if item is not None])
-                else:
-                    break
-        return output
-
-    _get_followed_artists = lambda **kwargs: spotify_session.current_user_followed_artists(**kwargs)
-    return await repeat_on_request_error(_fetch_all_artists_from_spotify_in_chunks, _get_followed_artists)
-
 async def prepare_artist_sync(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
     """ First phase of followed-artist sync: load the Spotify follows, resolve the ones already
         followed on Tidal, and register the remaining 'wanted' artists so that any subsequent
@@ -803,27 +675,6 @@ def get_user_playlist_mappings(spotify_session: spotipy.Spotify, tidal_session: 
     for spotify_playlist in spotify_playlists:
         results.append( pick_tidal_playlist_for_spotify_playlist(spotify_playlist, tidal_playlists) )
     return results
-
-async def get_playlists_from_spotify(spotify_session: spotipy.Spotify, config):
-    # get all the playlists from the Spotify account
-    playlists = []
-    print("Loading Spotify playlists")
-    first_results = await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_playlists)
-    exclude_list = set([x.split(':')[-1] for x in config.get('excluded_playlists', [])])
-    playlists.extend([p for p in first_results['items']])
-    user_id = (await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user))['id']
-
-    # get all the remaining playlists in parallel
-    if first_results['next']:
-        offsets = [ first_results['limit'] * n for n in range(1, math.ceil(first_results['total']/first_results['limit'])) ]
-        extra_results = await atqdm.gather( *[repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_playlists, offset=offset) for offset in offsets ] )
-        for extra_result in extra_results:
-            playlists.extend([p for p in extra_result['items']])
-
-    # filter out playlists that don't belong to us or are on the exclude list
-    my_playlist_filter = lambda p: p and p['owner']['id'] == user_id
-    exclude_filter = lambda p: not p['id'] in exclude_list
-    return list(filter( exclude_filter, filter( my_playlist_filter, playlists )))
 
 def get_playlists_from_config(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
     # get the list of playlist sync mappings from the configuration file
