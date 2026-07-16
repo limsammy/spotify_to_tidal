@@ -1,6 +1,6 @@
 # spotify_to_tidal (modified)
 
-> **Note:** This is a modified version of [spotify2tidal/spotify_to_tidal](https://github.com/spotify2tidal/spotify_to_tidal) with the following changes:
+> **Note:** This is a modified, work-in-progress version of [spotify2tidal/spotify_to_tidal](https://github.com/spotify2tidal/spotify_to_tidal). We use it to keep Tidal in sync with our Spotify library for a recently rebuilt minimal hifi setup — Moondrop Blessing 3 IEMs fed by a Fosi desktop DAC/amp at the desk and a Qudelix 5K on the go. Changes from upstream:
 >
 > - **uv integration** — the project is run with [uv](https://docs.astral.sh/uv/); no manual venv or pip install needed.
 > - **Interactive track matching** — when the automatic search can't find a track on Tidal, you're shown up to 5 candidate matches and can pick one (`1-5`) or skip (`s`), instead of the track silently being left out.
