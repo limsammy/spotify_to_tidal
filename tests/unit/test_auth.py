@@ -1,12 +1,9 @@
 # tests/unit/test_auth.py
 
-import pytest
+
 import spotipy
-import tidalapi
-import yaml
-import sys
-from unittest import mock
-from spotify_to_tidal.auth import open_spotify_session, open_tidal_session, SPOTIFY_SCOPES
+
+from spotify_to_tidal.auth import SPOTIFY_SCOPES, open_spotify_session
 
 
 def test_open_spotify_session(mocker):

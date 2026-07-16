@@ -1,5 +1,7 @@
-import requests
 from unittest.mock import Mock
+
+import pytest
+import requests
 
 import spotify_to_tidal.tidalapi_patch as patch_module
 from spotify_to_tidal.tidalapi_patch import _retry_on_412
@@ -30,9 +32,6 @@ def test_non_412_propagates():
     def fail():
         raise _http_error(500)
 
-    try:
+    with pytest.raises(requests.HTTPError):
         _retry_on_412(playlist, fail)
-        assert False, "should have raised"
-    except requests.HTTPError:
-        pass
     assert playlist._reparse.call_count == 0
