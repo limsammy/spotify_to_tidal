@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
-from .cache import failure_cache, track_match_cache
+from .cache import failure_cache, track_match_cache, manual_match_cache
 import datetime
 from difflib import SequenceMatcher
 from functools import partial
@@ -318,9 +318,16 @@ def remove_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, playli
 
 def interactively_match_tracks(tidal_session: tidalapi.Session, spotify_tracks: Sequence[t_spotify.SpotifyTrack]):
     """ prompt the user to manually pick a Tidal match for any track the automatic search failed on """
-    # ponytail: picks live only in the in-memory cache, so re-running re-prompts for the same tracks;
-    # add a persistent match table (like MatchFailureDatabase) if that gets annoying
-    unmatched = [t for t in spotify_tracks if t['id'] and not track_match_cache.get(t['id'])]
+    # apply previously confirmed manual picks before prompting
+    unmatched = []
+    for t in spotify_tracks:
+        if not t['id'] or track_match_cache.get(t['id']):
+            continue
+        cached_pick = manual_match_cache.get(t['id'])
+        if cached_pick:
+            track_match_cache.insert((t['id'], cached_pick))
+        else:
+            unmatched.append(t)
     if not unmatched or not sys.stdin.isatty():
         return
     print(f"\n{len(unmatched)} track(s) had no automatic match. Searching for candidates...")
@@ -345,6 +352,7 @@ def interactively_match_tracks(tidal_session: tidalapi.Session, spotify_tracks: 
             if choice.isdigit() and 1 <= int(choice) <= len(candidates):
                 picked = candidates[int(choice) - 1]
                 track_match_cache.insert((spotify_track['id'], picked.id))
+                manual_match_cache.insert(spotify_track['id'], picked.id)
                 failure_cache.remove_match_failure(spotify_track['id'])
                 break
 

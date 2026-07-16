@@ -1,6 +1,6 @@
 import datetime
 import sqlalchemy
-from sqlalchemy import Table, Column, String, DateTime, MetaData, insert, select, update, delete
+from sqlalchemy import Table, Column, String, Integer, DateTime, MetaData, insert, select, update, delete
 from typing import Dict, List, Sequence, Set, Mapping
 
 
@@ -79,6 +79,37 @@ class TrackMatchCache:
         self.data[mapping[0]] = mapping[1]
 
 
+class ManualMatchDatabase:
+    """
+    sqlite mapping of spotify track id -> tidal track id, persisting manually confirmed matches between runs
+    """
+
+    def __init__(self, filename='.cache.db'):
+        self.engine = sqlalchemy.create_engine(f"sqlite:///{filename}")
+        meta = MetaData()
+        self.matches = Table('manual_matches', meta,
+                             Column('spotify_id', String, primary_key=True),
+                             Column('tidal_id', Integer),
+                             sqlite_autoincrement=False)
+        meta.create_all(self.engine)
+
+    def get(self, spotify_id: str) -> int | None:
+        statement = select(self.matches.c.tidal_id).where(
+            self.matches.c.spotify_id == spotify_id)
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).fetchone()
+            return row.tidal_id if row else None
+
+    def insert(self, spotify_id: str, tidal_id: int):
+        with self.engine.connect() as connection:
+            with connection.begin():
+                connection.execute(delete(self.matches).where(
+                    self.matches.c.spotify_id == spotify_id))
+                connection.execute(insert(self.matches), {
+                                   "spotify_id": spotify_id, "tidal_id": tidal_id})
+
+
 # Main singleton instance
 failure_cache = MatchFailureDatabase()
 track_match_cache = TrackMatchCache()
+manual_match_cache = ManualMatchDatabase()

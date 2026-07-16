@@ -53,7 +53,7 @@ Spotify: Pretenders - My City Was Gone (185s)
 Pick a match [1-5] or s(kip):
 ```
 
-Pick a number to add that track to the Tidal playlist, or `s` (or just Enter) to skip it. Note that manual picks are not persisted between runs, so a future re-sync will prompt again for the same tracks.
+Pick a number to add that track to the Tidal playlist, or `s` (or just Enter) to skip it. Manual picks are stored in `.cache.db`, so future re-syncs reuse them without prompting again (skipped tracks are re-asked).
 
 ### Removing tracks from both playlists
 
