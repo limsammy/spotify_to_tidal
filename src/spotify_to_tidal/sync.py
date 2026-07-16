@@ -168,7 +168,8 @@ async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable) -> List[di
         offsets = [results['limit'] * n for n in range(1, math.ceil(results['total'] / results['limit']))]
         extra_results = await atqdm.gather(
             *[asyncio.to_thread(fetch_function, offset) for offset in offsets],
-            desc="Fetching additional data chunks"
+            desc="Fetching additional data chunks",
+            dynamic_ncols=True
         )
         for extra_result in extra_results:
             output.extend([item['track'] for item in extra_result['items'] if item['track'] is not None])
@@ -268,7 +269,7 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
     task_description = "Searching Tidal for {}/{} tracks in Spotify playlist '{}'".format(len(tracks_to_search), len(spotify_tracks), playlist_name)
     semaphore = asyncio.Semaphore(config.get('max_concurrency', 10))
     rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore))
-    search_results = await atqdm.gather( *[ repeat_on_request_error(tidal_search, t, semaphore, tidal_session) for t in tracks_to_search ], desc=task_description )
+    search_results = await atqdm.gather( *[ repeat_on_request_error(tidal_search, t, semaphore, tidal_session) for t in tracks_to_search ], desc=task_description, dynamic_ncols=True )
     rate_limiter_task.cancel()
 
     # Add the search results to the cache
@@ -412,7 +413,7 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
     await search_new_tracks_on_tidal(tidal_session, spotify_tracks, "Favorites", config)
     new_tidal_favorite_ids = get_new_tidal_favorites()
     if new_tidal_favorite_ids:
-        for tidal_id in tqdm(new_tidal_favorite_ids, desc="Adding new tracks to Tidal favorites"):
+        for tidal_id in tqdm(new_tidal_favorite_ids, desc="Adding new tracks to Tidal favorites", dynamic_ncols=True):
             tidal_session.user.favorites.add_track(tidal_id)
     else:
         print("No new tracks to add to Tidal favorites")
@@ -457,7 +458,7 @@ async def get_playlists_from_spotify(spotify_session: spotipy.Spotify, config):
     # get all the remaining playlists in parallel
     if first_results['next']:
         offsets = [ first_results['limit'] * n for n in range(1, math.ceil(first_results['total']/first_results['limit'])) ]
-        extra_results = await atqdm.gather( *[asyncio.to_thread(spotify_session.current_user_playlists, offset=offset) for offset in offsets ] )
+        extra_results = await atqdm.gather( *[asyncio.to_thread(spotify_session.current_user_playlists, offset=offset) for offset in offsets ], dynamic_ncols=True )
         for extra_result in extra_results:
             playlists.extend([p for p in extra_result['items']])
 

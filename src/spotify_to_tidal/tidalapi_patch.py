@@ -27,7 +27,7 @@ def _remove_indices_from_playlist(playlist: tidalapi.UserPlaylist, indices: List
     playlist._reparse()
 
 def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
-    with tqdm(desc="Erasing existing tracks from Tidal playlist", total=playlist.num_tracks) as progress:
+    with tqdm(dynamic_ncols=True, desc="Erasing existing tracks from Tidal playlist", total=playlist.num_tracks) as progress:
         while playlist.num_tracks:
             indices = range(min(playlist.num_tracks, chunk_size))
             _remove_indices_from_playlist(playlist, indices)
@@ -35,7 +35,7 @@ def clear_tidal_playlist(playlist: tidalapi.UserPlaylist, chunk_size: int=20):
     
 def add_multiple_tracks_to_playlist(playlist: tidalapi.UserPlaylist, track_ids: List[int], chunk_size: int=20):
     offset = 0
-    with tqdm(desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
+    with tqdm(dynamic_ncols=True, desc="Adding new tracks to Tidal playlist", total=len(track_ids)) as progress:
         while offset < len(track_ids):
             count = min(chunk_size, len(track_ids) - offset)
             _retry_on_412(playlist, lambda: playlist.add(track_ids[offset:offset+chunk_size]))
@@ -61,7 +61,8 @@ async def _get_all_chunks(url, session, parser, params={}) -> List[tidalapi.Trac
         offsets = [limit * n for n in range(1, math.ceil(total/limit))]
         extra_results = await atqdm.gather(
                 *[asyncio.to_thread(lambda offset: session.request.map_json(_make_request(offset), parse=parser), offset) for offset in offsets],
-            desc="Fetching additional data chunks"
+            desc="Fetching additional data chunks",
+            dynamic_ncols=True
         )
         for extra_result in extra_results:
             items.extend(extra_result)
