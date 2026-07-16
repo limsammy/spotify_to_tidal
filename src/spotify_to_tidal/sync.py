@@ -288,6 +288,66 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
             file.write(f"{song}\n")
 
             
+def remove_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, playlist_id: str, query: str):
+    """ remove tracks matching 'album:<spotify_album_id>' or 'track:<spotify_track_id>' from the Spotify playlist """
+    kind, _, value = query.partition(':')
+    if kind == 'album' and value:
+        results = spotify_session.album_tracks(value)
+        ids_to_remove = {t['id'] for t in results['items']}
+        while results['next']:
+            results = spotify_session.next(results)
+            ids_to_remove.update(t['id'] for t in results['items'])
+    elif kind == 'track' and value:
+        ids_to_remove = {value}
+    else:
+        sys.exit("Unsupported --remove-tracks query; use 'album:<spotify_album_id>' or 'track:<spotify_track_id>'")
+
+    playlist_tracks = asyncio.run(get_tracks_from_spotify_playlist(spotify_session, spotify_session.playlist(playlist_id)))
+    to_remove = [t for t in playlist_tracks if t['id'] in ids_to_remove]
+    if not to_remove:
+        print("No matching tracks found in the Spotify playlist")
+        return
+    print(f"Tracks to remove from Spotify playlist:")
+    for t in to_remove:
+        print(f"  {', '.join(a['name'] for a in t['artists'])} - {t['name']}")
+    if input(f"Remove these {len(to_remove)} track(s)? [y/N]: ").strip().lower() != 'y':
+        print("Aborting removal")
+        return
+    spotify_session.playlist_remove_all_occurrences_of_items(playlist_id, [t['id'] for t in to_remove])
+    print("Removed from Spotify; the following sync will remove them from Tidal")
+
+def interactively_match_tracks(tidal_session: tidalapi.Session, spotify_tracks: Sequence[t_spotify.SpotifyTrack]):
+    """ prompt the user to manually pick a Tidal match for any track the automatic search failed on """
+    # ponytail: picks live only in the in-memory cache, so re-running re-prompts for the same tracks;
+    # add a persistent match table (like MatchFailureDatabase) if that gets annoying
+    unmatched = [t for t in spotify_tracks if t['id'] and not track_match_cache.get(t['id'])]
+    if not unmatched or not sys.stdin.isatty():
+        return
+    print(f"\n{len(unmatched)} track(s) had no automatic match. Searching for candidates...")
+    for spotify_track in unmatched:
+        artists = ', '.join(a['name'] for a in spotify_track['artists'])
+        query = simple(spotify_track['name']) + ' ' + simple(spotify_track['artists'][0]['name'])
+        candidates = [t for t in tidal_session.search(query, models=[tidalapi.media.Track])['tracks'] if t.available][:5]
+        if not candidates:
+            candidates = [t for t in tidal_session.search(simple(spotify_track['name']), models=[tidalapi.media.Track])['tracks'] if t.available][:5]
+        print(f"\nSpotify: {artists} - {spotify_track['name']} ({spotify_track['duration_ms']//1000}s)")
+        if not candidates:
+            print("  No candidates found on Tidal, skipping")
+            continue
+        for i, c in enumerate(candidates, 1):
+            c_artists = ', '.join(a.name for a in c.artists)
+            version = f" ({c.version})" if c.version else ""
+            print(f"  {i}. {c_artists} - {c.name}{version} [{c.album.name}] ({c.duration}s)")
+        while True:
+            choice = input(f"Pick a match [1-{len(candidates)}] or s(kip): ").strip().lower()
+            if choice in ('s', 'skip', ''):
+                break
+            if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+                picked = candidates[int(choice) - 1]
+                track_match_cache.insert((spotify_track['id'], picked.id))
+                failure_cache.remove_match_failure(spotify_track['id'])
+                break
+
 async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, spotify_playlist, tidal_playlist: tidalapi.Playlist | None, config: dict):
     """ sync given playlist to tidal """
     # Get the tracks from both Spotify and Tidal, creating a new Tidal playlist if necessary
@@ -304,6 +364,7 @@ async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalap
     # Extract the new tracks from the playlist that we haven't already seen before
     populate_track_match_cache(spotify_tracks, old_tidal_tracks)
     await search_new_tracks_on_tidal(tidal_session, spotify_tracks, spotify_playlist['name'], config)
+    interactively_match_tracks(tidal_session, spotify_tracks)
     new_tidal_track_ids = get_tracks_for_new_tidal_playlist(spotify_tracks)
 
     # Update the Tidal playlist if there are changes

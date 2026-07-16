@@ -10,6 +10,7 @@ def main():
     parser.add_argument('--config', default='config.yml', help='location of the config file')
     parser.add_argument('--uri', help='synchronize a specific URI instead of the one in the config')
     parser.add_argument('--sync-favorites', action=argparse.BooleanOptionalAction, help='synchronize the favorites')
+    parser.add_argument('--remove-tracks', help="remove matching tracks from the Spotify playlist given by --uri before syncing, e.g. 'album:<spotify_album_id>' or 'track:<spotify_track_id>'")
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -20,6 +21,10 @@ def main():
     tidal_session = _auth.open_tidal_session()
     if not tidal_session.check_login():
         sys.exit("Could not connect to Tidal")
+    if args.remove_tracks:
+        if not args.uri:
+            sys.exit("--remove-tracks requires --uri to specify the playlist")
+        _sync.remove_tracks_from_spotify_playlist(spotify_session, args.uri, args.remove_tracks)
     if args.uri:
         # if a playlist ID is explicitly provided as a command line argument then use that
         spotify_playlist = spotify_session.playlist(args.uri)

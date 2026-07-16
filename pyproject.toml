@@ -17,9 +17,9 @@ dependencies = [
   "pytest-mock~=3.8"
 ]
 
-[tools.setuptools.packages."spotify_to_tidal"]
-where = "src"
-include = "spotify_to_tidal*"
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["spotify_to_tidal*"]
 
 [project.scripts]
 spotify_to_tidal = "spotify_to_tidal.__main__:main"
