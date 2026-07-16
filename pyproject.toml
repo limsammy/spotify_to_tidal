@@ -23,3 +23,20 @@ include = ["spotify_to_tidal*"]
 
 [project.scripts]
 spotify_to_tidal = "spotify_to_tidal.__main__:main"
+
+[dependency-groups]
+dev = ["ruff>=0.15", "ty", "pre-commit>=4.0"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "UP", "I", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+[tool.ty.environment]
+python-version = "3.10"
